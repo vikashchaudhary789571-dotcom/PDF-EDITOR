@@ -105,6 +105,7 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
 
 /* =========================
@@ -169,11 +170,32 @@ app.get('/', (req, res) => {
 });
 
 /* =========================
+   GLOBAL ERROR HANDLER
+   Express 5 needs this to catch async errors
+   and return a proper 500 instead of connection reset.
+========================= */
+app.use((err, req, res, next) => {
+    console.error('❌ Global error handler caught:', err.message || err);
+    if (res.headersSent) {
+        return next(err);
+    }
+    res.status(err.status || 500).json({
+        success: false,
+        message: err.message || 'Internal server error'
+    });
+});
+
+/* =========================
    START SERVER
 ========================= */
 const server = app.listen(PORT, () => {
     console.log(`🚀 Server running on port ${PORT}`);
 });
+
+// Increase timeouts for large file uploads (5 minutes)
+server.timeout = 300000;
+server.keepAliveTimeout = 120000;
+server.headersTimeout = 120000;
 
 /* =========================
    ERROR HANDLING

@@ -126,10 +126,28 @@ exports.uploadStatement = async (req, res) => {
             }
         }
 
-        const parser = new PDFParse({ data: dataBuffer });
+        let parser;
+        let text = '';
+        let tableResult = null;
 
-        const textResult = await parser.getText();
-        const text = textResult.text;
+        try {
+            parser = new PDFParse({ data: dataBuffer });
+            const textResult = await parser.getText();
+            text = textResult.text || '';
+        } catch (parseErr) {
+            console.error('[uploadStatement] PDFParse getText failed:', parseErr.message);
+            // If it's a password error, give a helpful message
+            if (parseErr.message && (parseErr.message.includes('password') || parseErr.message.includes('encrypt'))) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'This PDF appears to be password-protected. Please provide the password and try again.'
+                });
+            }
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to parse PDF: ' + parseErr.message
+            });
+        }
 
         // --- SEARCHING BALANCES ---
         // Heuristic: Match 'Opening/Closing Balance' followed by anything until we find a number
@@ -140,7 +158,12 @@ exports.uploadStatement = async (req, res) => {
         let closingBalance = cbMatch ? parseFloat(cbMatch[1].replace(/,/g, '')) : null;
 
         // --- EXTRACTING TABLE ---
-        const tableResult = await parser.getTable();
+        try {
+            tableResult = await parser.getTable();
+        } catch (tableErr) {
+            console.warn('[uploadStatement] pdf-parse getTable failed, trying to continue without tables:', tableErr.message);
+            tableResult = { pages: [] }; // Mock empty pages to avoid crashing below
+        }
         const transactions = [];
 
         if (tableResult.pages && tableResult.pages.length > 0) {
