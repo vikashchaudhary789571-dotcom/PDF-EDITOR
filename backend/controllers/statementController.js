@@ -94,10 +94,15 @@ exports.uploadStatement = async (req, res) => {
         return res.status(400).json({ success: false, message: 'No file uploaded' });
     }
 
+    console.log('[uploadStatement] req.body:', JSON.stringify(req.body));
+    console.log('[uploadStatement] req.file:', req.file.originalname);
+
     try {
         const filePath = path.join(__dirname, '../uploads', req.file.filename);
         let dataBuffer = fs.readFileSync(filePath);
         const password = req.body.password;
+        
+        console.log('[uploadStatement] Password received:', password ? 'YES (length: ' + password.length + ')' : 'NO');
 
         // If password is provided, try to decrypt the PDF first
         if (password) {
