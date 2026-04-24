@@ -131,16 +131,43 @@ exports.uploadStatement = async (req, res) => {
 
         try {
             console.log('[uploadStatement] Creating PDFParse with buffer size:', dataBuffer.length);
-            parser = new PDFParse({ data: dataBuffer });
+            
+            // Try parsing - if it still complains about password, pass it anyway
+            const parseOptions = { data: dataBuffer };
+            if (password) {
+                // Even though we decrypted, pdf-parse might still need the password
+                parseOptions.password = password;
+            }
+            
+            parser = new PDFParse(parseOptions);
             const textResult = await parser.getText();
             text = textResult.text || '';
             console.log('[uploadStatement] PDFParse getText successful, text length:', text.length);
         } catch (parseErr) {
             console.error('[uploadStatement] PDFParse getText failed:', parseErr.message);
-            return res.status(500).json({
-                success: false,
-                message: 'Failed to parse PDF: ' + parseErr.message
-            });
+            
+            // If we have a password and it still failed, try WITHOUT the password
+            // (the decrypted buffer should work without it)
+            if (password && (parseErr.message.includes('password') || parseErr.message.includes('No password'))) {
+                console.log('[uploadStatement] Retrying PDFParse without password on decrypted buffer...');
+                try {
+                    parser = new PDFParse({ data: dataBuffer });
+                    const textResult = await parser.getText();
+                    text = textResult.text || '';
+                    console.log('[uploadStatement] PDFParse retry successful, text length:', text.length);
+                } catch (retryErr) {
+                    console.error('[uploadStatement] PDFParse retry also failed:', retryErr.message);
+                    return res.status(500).json({
+                        success: false,
+                        message: 'Failed to parse PDF: ' + retryErr.message
+                    });
+                }
+            } else {
+                return res.status(500).json({
+                    success: false,
+                    message: 'Failed to parse PDF: ' + parseErr.message
+                });
+            }
         }
 
         // --- SEARCHING BALANCES ---
