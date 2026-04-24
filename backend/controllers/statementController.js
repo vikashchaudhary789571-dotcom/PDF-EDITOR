@@ -96,60 +96,22 @@ exports.uploadStatement = async (req, res) => {
 
     try {
         const filePath = path.join(__dirname, '../uploads', req.file.filename);
-        let dataBuffer = fs.readFileSync(filePath);
+        const dataBuffer = fs.readFileSync(filePath);
         const password = req.body.password;
 
-        // If password is provided, try to decrypt the PDF first
-        if (password) {
-            try {
-                console.log('[uploadStatement] Attempting to decrypt PDF with password...');
-                
-                // Try multiple approaches to decrypt
-                let pdfDoc = null;
-                
-                // Approach 1: Try with ignoreEncryption: false (strict mode)
-                try {
-                    pdfDoc = await PDFDocument.load(dataBuffer, {
-                        password: password,
-                        ignoreEncryption: false
-                    });
-                    console.log('[uploadStatement] PDF decrypted successfully (strict mode)');
-                } catch (strictErr) {
-                    console.log('[uploadStatement] Strict mode failed, trying ignoreEncryption: true');
-                    // Approach 2: Try with ignoreEncryption: true (lenient mode)
-                    pdfDoc = await PDFDocument.load(dataBuffer, {
-                        password: password,
-                        ignoreEncryption: true
-                    });
-                    console.log('[uploadStatement] PDF decrypted successfully (lenient mode)');
-                }
-                
-                // Save the decrypted PDF back to buffer
-                dataBuffer = await pdfDoc.save();
-                
-                // Overwrite the original file with the decrypted version
-                fs.writeFileSync(filePath, dataBuffer);
-                console.log('[uploadStatement] PDF decrypted and saved successfully');
-            } catch (err) {
-                console.error('[uploadStatement] Password decryption failed:', err.message);
-                console.error('[uploadStatement] Error details:', err);
-                return res.status(400).json({
-                    success: false,
-                    message: 'Incorrect password or failed to decrypt PDF. Please check the password and try again. Error: ' + err.message
-                });
-            }
-        }
+        console.log('[uploadStatement] Starting PDF processing, password provided:', !!password);
 
+        // Use pdf-parse directly with password if provided
+        // pdf-parse v2 uses PDF.js which can handle password-protected PDFs
         let parser;
         let text = '';
         let tableResult = null;
 
         try {
-            // If we decrypted the PDF, we still need to pass the password to pdf-parse
-            // because pdf-parse has its own PDF.js instance that checks encryption
             console.log('[uploadStatement] Creating PDFParse with buffer size:', dataBuffer.length);
             
             const parseOptions = { data: dataBuffer };
+            // Pass password to pdf-parse if provided
             if (password) {
                 parseOptions.password = password;
                 console.log('[uploadStatement] Passing password to PDFParse');
@@ -162,10 +124,10 @@ exports.uploadStatement = async (req, res) => {
         } catch (parseErr) {
             console.error('[uploadStatement] PDFParse getText failed:', parseErr.message);
             // If it's a password error, give a helpful message
-            if (parseErr.message && (parseErr.message.includes('password') || parseErr.message.includes('encrypt'))) {
+            if (parseErr.message && (parseErr.message.includes('password') || parseErr.message.includes('encrypt') || parseErr.message.includes('Password'))) {
                 return res.status(400).json({
                     success: false,
-                    message: 'This PDF appears to be password-protected. Please provide the password and try again.'
+                    message: 'This PDF appears to be password-protected. Please provide the correct password and try again.'
                 });
             }
             return res.status(500).json({
