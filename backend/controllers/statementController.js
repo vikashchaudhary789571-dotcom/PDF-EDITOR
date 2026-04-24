@@ -96,40 +96,47 @@ exports.uploadStatement = async (req, res) => {
 
     try {
         const filePath = path.join(__dirname, '../uploads', req.file.filename);
-        const dataBuffer = fs.readFileSync(filePath);
+        let dataBuffer = fs.readFileSync(filePath);
         const password = req.body.password;
 
         console.log('[uploadStatement] Starting PDF processing, password provided:', !!password);
 
-        // Use pdf-parse directly with password if provided
-        // pdf-parse v2 uses PDF.js which can handle password-protected PDFs
+        // If password is provided, decrypt with pdf-lib and save the decrypted version
+        // This allows both pdf-parse and the frontend PDF.js to read it without issues
+        if (password) {
+            try {
+                console.log('[uploadStatement] Decrypting PDF with pdf-lib...');
+                const pdfDoc = await PDFDocument.load(dataBuffer, {
+                    password: password,
+                    ignoreEncryption: true  // Use lenient mode for better compatibility
+                });
+                
+                // Save the decrypted PDF
+                dataBuffer = await pdfDoc.save();
+                fs.writeFileSync(filePath, dataBuffer);
+                console.log('[uploadStatement] PDF decrypted and saved successfully');
+            } catch (decryptErr) {
+                console.error('[uploadStatement] PDF decryption failed:', decryptErr.message);
+                return res.status(400).json({
+                    success: false,
+                    message: 'Incorrect password or failed to decrypt PDF. Please check the password and try again.'
+                });
+            }
+        }
+
+        // Now parse the (decrypted) PDF
         let parser;
         let text = '';
         let tableResult = null;
 
         try {
             console.log('[uploadStatement] Creating PDFParse with buffer size:', dataBuffer.length);
-            
-            const parseOptions = { data: dataBuffer };
-            // Pass password to pdf-parse if provided
-            if (password) {
-                parseOptions.password = password;
-                console.log('[uploadStatement] Passing password to PDFParse');
-            }
-            
-            parser = new PDFParse(parseOptions);
+            parser = new PDFParse({ data: dataBuffer });
             const textResult = await parser.getText();
             text = textResult.text || '';
             console.log('[uploadStatement] PDFParse getText successful, text length:', text.length);
         } catch (parseErr) {
             console.error('[uploadStatement] PDFParse getText failed:', parseErr.message);
-            // If it's a password error, give a helpful message
-            if (parseErr.message && (parseErr.message.includes('password') || parseErr.message.includes('encrypt') || parseErr.message.includes('Password'))) {
-                return res.status(400).json({
-                    success: false,
-                    message: 'This PDF appears to be password-protected. Please provide the correct password and try again.'
-                });
-            }
             return res.status(500).json({
                 success: false,
                 message: 'Failed to parse PDF: ' + parseErr.message
