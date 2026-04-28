@@ -1,7 +1,9 @@
 import axios from 'axios';
 
 const api = axios.create({
-    baseURL: 'https://statsedit-api.onrender.com/api',
+    // In development, Vite proxies /api → http://localhost:5001/api (no CORS issues).
+    // In production, this resolves to the same origin as the deployed frontend.
+    baseURL: '/api',
     headers: {
         'Content-Type': 'application/json',
     },

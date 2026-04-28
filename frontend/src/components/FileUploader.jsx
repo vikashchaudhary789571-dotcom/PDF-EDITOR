@@ -65,8 +65,10 @@ export function FileUploader({ onUpload }) {
                 if (response.success) {
                     // Success! Reset states and proceed
                     console.log('[FileUploader] Upload successful!');
+                    console.log('[FileUploader] Transactions received:', response.transactions?.length || 0);
+                    console.log('[FileUploader] Password in response:', !!response.file?.password);
                     setIsPasswordRequired(false);
-                    onUpload(file, response.file.fileUrl, response.transactions, response.openingBalance, response.closingBalance);
+                    onUpload(file, response.file.fileUrl, response.transactions, response.openingBalance, response.closingBalance, response.file?.password);
                 } else {
                     console.error('[FileUploader] Upload failed:', response.message);
                     // Check if backend says password is required

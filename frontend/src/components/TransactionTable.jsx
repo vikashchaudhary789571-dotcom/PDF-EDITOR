@@ -61,6 +61,17 @@ export function TransactionTable(props) {
         return parseFloat(String(lastBalance).replace(/,/g, '')) || 0;
     }, [transactions, initOpening]);
 
+    // Calculate totals for debit and credit columns - auto-updates when transactions change
+    const totals = useMemo(() => {
+        return transactions.reduce((acc, t) => {
+            const debit = parseFloat(String(t.debit || 0).replace(/,/g, '')) || 0;
+            const credit = parseFloat(String(t.credit || 0).replace(/,/g, '')) || 0;
+            acc.debit += debit;
+            acc.credit += credit;
+            return acc;
+        }, { debit: 0, credit: 0 });
+    }, [transactions]);
+
     const getRecalculatedTransactions = (txns, openBal) => {
         let currentBalance = parseFloat(openBal) || 0;
         return txns.map(t => {
@@ -291,6 +302,31 @@ export function TransactionTable(props) {
                                             <p className="text-lg font-medium">No transactions extracted.</p>
                                             <p className="text-sm">Try uploading a clearer statement PDF.</p>
                                         </div>
+                                    </TableCell>
+                                </TableRow>
+                            )}
+                            {/* Total Row - Auto-calculates when credit/debit values change */}
+                            {transactions.length > 0 && (
+                                <TableRow className="bg-slate-100 border-t-2 border-slate-300 font-bold">
+                                    <TableCell className="text-[12px] text-slate-600 font-bold"></TableCell>
+                                    <TableCell className="p-2 text-[13px] text-slate-800 font-bold">Total</TableCell>
+                                    <TableCell className="p-2"></TableCell>
+                                    <TableCell className="p-2"></TableCell>
+                                    <TableCell className="p-2"></TableCell>
+                                    <TableCell className="p-2 text-right">
+                                        <span className="font-financial text-[13px] text-red-700 font-bold">
+                                            {totals.debit > 0 ? totals.debit.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '-'}
+                                        </span>
+                                    </TableCell>
+                                    <TableCell className="p-2 text-right">
+                                        <span className="font-financial text-[13px] text-emerald-700 font-bold">
+                                            {totals.credit > 0 ? totals.credit.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '-'}
+                                        </span>
+                                    </TableCell>
+                                    <TableCell className="p-2 text-right">
+                                        <span className="font-financial text-[14px] text-slate-900 font-bold">
+                                            {closingBalance.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                        </span>
                                     </TableCell>
                                 </TableRow>
                             )}

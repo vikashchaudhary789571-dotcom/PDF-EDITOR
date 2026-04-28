@@ -50,7 +50,7 @@ export function SectionPlaceholder({ title, description, icon }) {
     const handleDownload = async (item) => {
         setDownloading(item.id);
         try {
-            const downloadUrl = `https://statsedit-api.onrender.com/api/statements/download-file?fileUrl=${encodeURIComponent(item.fileUrl)}`;
+            const downloadUrl = `/api/statements/download-file?fileUrl=${encodeURIComponent(item.fileUrl)}`;
             const res = await fetch(downloadUrl);
             if (!res.ok) throw new Error(`Server returned ${res.status}`);
             const blob = await res.blob();

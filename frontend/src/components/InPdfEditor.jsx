@@ -10,7 +10,7 @@ import { TransactionTable } from './TransactionTable';
 pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
 
 export function InPdfEditor(props) {
-    const { fileUrl, onUpdateFileUrl } = props;
+    const { fileUrl, password, onUpdateFileUrl } = props;
     const [pdf, setPdf] = useState(null);
     const [numPages, setNumPages] = useState(0);
     const [pagesData, setPagesData] = useState([]); // Array of { pageIndex, textItems: [] }
@@ -26,81 +26,119 @@ export function InPdfEditor(props) {
     const [tableStructure, setTableStructure] = useState(null);
     const [fileVersion, setFileVersion] = useState(0);
     const [internalTransactions, setInternalTransactions] = useState(initialTransactions);
+    const [deducedOpeningBalance, setDeducedOpeningBalance] = useState(null);
 
     // Sync internalTransactions when initialTransactions prop changes
     useEffect(() => {
-        if (initialTransactions && initialTransactions.length > 0) {
+        // When a new file is uploaded, the parent provides new initialTransactions.
+        // We ALWAYS accept them as the baseline. The visual parser will overwrite 
+        // them later if it succeeds in extracting better structured data.
+        if (initialTransactions) {
             setInternalTransactions(initialTransactions);
         }
     }, [initialTransactions]);
 
     const analyzeTableStructure = (allPagesData) => {
-        const dateSigs = ['date', 'value dt', 'vldt', 'tran date', 'value date'];
-        const debitSigs = ['debit', 'withdrawal', 'payment', 'paid out', 'dr(', 'dr (', 'dr (₹)'];
-        const creditSigs = ['credit', 'deposit', 'receipt', 'paid in', 'cr(', 'cr (', 'cr (₹)'];
-        const balanceSigs = ['balance', 'bal (', 'bal(₹)'];
+        const dateSigs    = ['date', 'value dt', 'vldt', 'tran date', 'value date', 'txn date', 'trans date', 'posting'];
+        const debitSigs   = ['debit', 'withdrawal', 'payment', 'paid out', 'dr(', 'dr (', 'dr (₹)', 'withdraw', '(dr', 'dr.'];
+        const creditSigs  = ['credit', 'deposit', 'receipt', 'paid in', 'cr(', 'cr (', 'cr (₹)', '(cr', 'cr.'];
+        const balanceSigs = ['balance', 'bal (', 'bal(₹)', 'bal.'];
+
+        const findItem = (items, sigs, exclude = []) => {
+            // Only consider text items that are not massive paragraphs. 
+            // 200 safely accommodates an entire table header row merged into a single string by pdf.js
+            const validItems = items.filter(it => (it.text || '').trim().length < 200);
+
+            let found = validItems.find(it => {
+                const t = (it.text || '').toLowerCase();
+                if (exclude.some(e => t.includes(e))) return false;
+                return sigs.some(s => t.includes(s));
+            });
+            if (found) return found;
+
+            found = validItems.find(it => {
+                const t = (it.text || '').toLowerCase();
+                if (exclude.some(e => t.includes(e))) return false;
+                return sigs.some(s => s.split(' ').some(word => word.length > 2 && t.includes(word)));
+            });
+            return found || null;
+        };
 
         for (const page of allPagesData) {
-            const items = page.items;
-            const rows = [];
-            let currentRow = [];
-            let lastY = -1;
-            const sorted = [...items].sort((a, b) => b.y - a.y);
-            sorted.forEach(it => {
-                if (Math.abs(it.y - lastY) > 5) {
-                    if (currentRow.length > 0) rows.push(currentRow);
-                    currentRow = [it];
-                    lastY = it.y;
-                } else {
-                    currentRow.push(it);
-                }
+            // 1. Find all valid Date header candidates on the page
+            const dateCandidates = page.items.filter(it => {
+                const t = (it.text || '').toLowerCase();
+                const excludes = ['statement', 'opening', 'closing', 'open', 'from', 'to'];
+                if (excludes.some(e => t.includes(e))) return false;
+                
+                if (dateSigs.some(s => t.includes(s))) return true;
+                if (dateSigs.some(s => s.split(' ').some(word => word.length > 2 && t.includes(word)))) return true;
+                return false;
             });
-            if (currentRow.length > 0) rows.push(currentRow);
 
-            for (const row of rows) {
-                const textJoined = row.map(it => it.text.toLowerCase()).join(' ');
-                if (textJoined.includes(':')) continue;
-                if (textJoined.includes('opening') || textJoined.includes('closing')) continue;
+            // 2. For each candidate, find the other headers strictly within its horizontal row (+/- 120pt)
+            // 120pt safely encompasses exceptionally tall, multi-line table headers found in scaled SBI statements.
+            for (const mDate of dateCandidates) {
+                const headerRowCandidates = page.items.filter(it => Math.abs(it.y - mDate.y) < 120);
 
-                const findMatch = (sigs) => row.find(it => sigs.some(s => it.text.toLowerCase().includes(s)));
-                const mDate = findMatch(dateSigs);
-                const mDebit = findMatch(debitSigs);
-                const mCredit = findMatch(creditSigs);
-                const mBalance = findMatch(balanceSigs);
+                const mDebit   = findItem(headerRowCandidates, debitSigs);
+                const mCredit  = findItem(headerRowCandidates, creditSigs);
+                const mBalance = findItem(headerRowCandidates, balanceSigs, ['opening', 'closing', 'clear', 'avg', 'average', 'mod', 'lien', 'forward', 'summary']);
 
-                if (mDate && (mDebit || mCredit || mBalance)) {
-                    const getX = (it) => it ? it.x + it.width / 2 : null;
+                // If Date is found, we lock onto this row as the header row, even if amount headers are oddly named/missing.
+                // We will rely on safe default X-coordinates if they are not found.
 
-                    const structure = {
-                        pageIndex: page.pageIndex,
-                        headerY: row[0].y,
-                        debitX: getX(mDebit),
-                        creditX: getX(mCredit),
-                        balanceX: getX(mBalance)
-                    };
+            const getX = (it) => it ? it.x + (it.width || 0) / 2 : null;
 
-                    // FALLBACKS: If a column isn't found, try to find it relative to others using standard spacing
-                    if (structure.debitX === null && structure.creditX !== null) structure.debitX = structure.creditX - 100;
-                    if (structure.creditX === null && structure.debitX !== null) structure.creditX = structure.debitX + 100;
-                    if (structure.balanceX === null && structure.creditX !== null) structure.balanceX = structure.creditX + 100;
+            const structure = {
+                pageIndex: page.pageIndex,
+                headerY: mDate.y, // Anchor transactions relative to the Date header
+                debitX:   getX(mDebit),
+                creditX:  getX(mCredit),
+                balanceX: getX(mBalance)
+            };
 
-                    // DEFINE BOUNDARIES: Midpoints between header centers
-                    structure.boundaries = {
-                        debitLeft: (structure.debitX || 400) - 50, // Default left of debit
-                        debitCredit: (structure.debitX + structure.creditX) / 2,
-                        creditBalance: (structure.creditX + structure.balanceX) / 2
-                    };
-
-                    console.log("[analyzeTableStructure] Final Bounded Structure:", structure);
-                    setTableStructure(structure);
-                    return;
-                }
+            // Fallbacks when a column header item wasn't found
+            if (structure.debitX === null && structure.creditX === null) {
+                structure.creditX = (structure.balanceX || (page.width - 50)) - 100;
+                structure.debitX = structure.creditX - 100;
             }
-        }
+            if (structure.debitX  === null && structure.creditX  !== null) structure.debitX  = structure.creditX  - 100;
+            if (structure.creditX === null && structure.debitX   !== null) structure.creditX  = structure.debitX   + 100;
+            if (structure.balanceX=== null && structure.creditX  !== null) structure.balanceX = structure.creditX  + 100;
+
+            structure.boundaries = {
+                debitLeft:     (structure.debitX || 400) - 120, // Accommodates very large right-aligned numbers
+                debitCredit:   (structure.debitX  + structure.creditX)  / 2,
+                creditBalance: (structure.creditX + structure.balanceX) / 2
+            };
+
+            console.log('[analyzeTableStructure] Detected structure:', structure);
+            setTableStructure(structure);
+            return structure;
+            } // Close for(const mDate of dateCandidates)
+        } // Close for(const page of allPagesData)
+
+        console.warn('[analyzeTableStructure] Could not detect table headers natively. Forcing default standard structure to guarantee visual parser execution.');
+        
+        // Return a standard A4 fallback structure so the visual parser ALWAYS runs.
+        // This ensures extraction succeeds even if headers are drawn as images or have bizarre names.
+        return {
+            pageIndex: 1,
+            headerY: 0,
+            debitX: 430,
+            creditX: 490,
+            balanceX: 550,
+            boundaries: {
+                debitLeft: 310,
+                debitCredit: 460,
+                creditBalance: 520
+            }
+        };
     };
 
-    const runAutoCalculation = (dataToProcess = null) => {
-        if (!tableStructure) return;
+    const runAutoCalculation = (dataToProcess = null, activeStructure = tableStructure) => {
+        if (!activeStructure) return;
 
         setPagesData(prevPages => {
             const sourcePages = dataToProcess || prevPages;
@@ -118,133 +156,228 @@ export function InPdfEditor(props) {
             // Process items top-to-bottom
             allItems.sort((a, b) => a.pageIdx === b.pageIdx ? b.y - a.y : a.pageIdx - b.pageIdx);
 
-            // Group into rows
+            // Group into rows, ensuring we break rows on page changes
             const rows = [];
             let currentRow = [];
             let lastY = -1;
+            let lastPageIdx = -1;
+            let rowAnchorY = -9999;
 
             allItems.forEach(item => {
-                if (Math.abs(item.y - lastY) > 5) {
+                const isNewPage = item.pageIdx !== lastPageIdx;
+                const isNewY = Math.abs(item.y - rowAnchorY) > 15; // Use 15pt tolerance, anchored to the first item
+
+                if (isNewPage || isNewY) {
                     if (currentRow.length > 0) rows.push(currentRow);
                     currentRow = [item];
-                    lastY = item.y;
+                    rowAnchorY = item.y; // Anchor to the first item of the row
+                    lastPageIdx = item.pageIdx;
                 } else {
                     currentRow.push(item);
+                    // Do NOT update rowAnchorY, to prevent chain-reaction merging
                 }
             });
             if (currentRow.length > 0) rows.push(currentRow);
 
             // Ripple Math logic
             let lastKnownBalance = null;
-            const updatedInternalTxns = [...internalTransactions];
-            let txnIdx = 0;
+            const newInternalTxns = [];
 
             rows.forEach((row) => {
-                // ROW FILTER: Must be below header if on same page, or on any subsequent page
-                const firstItem = row[0];
-                if (!firstItem) return;
+                try {
+                    // ROW FILTER: Must be on or after the header page
+                    const firstItem = row[0];
+                    if (!firstItem) return;
 
-                const isAfterHeaderPage = firstItem.pageIdx > tableStructure.pageIndex;
-                const isOnHeaderPageBelowHeader = firstItem.pageIdx === tableStructure.pageIndex && firstItem.y < tableStructure.headerY - 10;
+                    if (firstItem.pageIdx < activeStructure.pageIndex) return;
 
-                if (!isAfterHeaderPage && !isOnHeaderPageBelowHeader) return;
+                    // VALIDATION: Strict Transaction Row Verification
+                    const rowText = row.map(it => (it.text || '').toLowerCase()).join(' ');
 
-                // VALIDATION: Strict Transaction Row Verification
-                const rowText = row.map(it => (it.text || '').toLowerCase()).join(' ');
+                    // 1. Skip if it contains summary keywords
+                    if (rowText.includes('balance') && (rowText.includes('opening') || rowText.includes('closing'))) return;
 
-                // 1. Skip if it contains summary keywords
-                if (rowText.includes('balance') && (rowText.includes('opening') || rowText.includes('closing'))) return;
+                    // 2. REQUIRE a Date format to start/be in the row (e.g. DD MMM or DD/MM)
+                    // Supports DD/MM/YY, DD-MM-YYYY, DD MMM YYYY, and tolerates pdf.js kerning splits
+                    const dateRegex = /\b\d{1,2}\s*(?:[\/\-\.]|\s+)\s*(?:[A-Za-z]{3,}|\d{1,2})\s*(?:(?:[\/\-\.]|\s+)\s*\d{2,4})?\b/;
+                    if (!dateRegex.test(rowText)) return;
 
-                // 2. REQUIRE a Date format to start/be in the row (e.g. DD MMM or DD/MM)
-                const dateRegex = /\d{1,2}[\/\-\s](?:[A-Za-z]{3}|\d{1,2})/;
-                if (!dateRegex.test(rowText)) return;
-
-                // BOUNDED COLUMN ASSIGNMENT: Virtual "Walls" based on header centers
-                const rowItems = row.filter(it => /^[0-9,.\-\s()₹]+$/.test(it.text.trim()) || it.text.trim() === '-');
-                const columnAssignments = { debitItem: null, creditItem: null, balanceItem: null };
-
-                rowItems.forEach(it => {
-                    const mid = it.x + (it.width || 0) / 2;
-                    let targetKey = null;
-
-                    // Bucket check with safety minimum X (Debit should be after narration/ref, usually > 400px)
-                    if (mid < tableStructure.boundaries.debitLeft) return;
-
-                    if (mid < tableStructure.boundaries.debitCredit) {
-                        targetKey = 'debitItem';
-                    } else if (mid < tableStructure.boundaries.creditBalance) {
-                        targetKey = 'creditItem';
-                    } else {
-                        targetKey = 'balanceItem';
-                    }
-
-                    const existing = columnAssignments[targetKey];
-                    if (!existing || (it.text !== '-' && existing.text === '-')) {
-                        columnAssignments[targetKey] = it;
-                    }
-                });
-
-                const { debitItem, creditItem, balanceItem } = columnAssignments;
-
-                if (balanceItem) {
-                    const cleanNum = (txt) => {
-                        if (!txt || txt === '-' || txt.trim() === '') return 0;
-                        let val = txt.replace(/,/g, '').replace(/\((.*)\)/, '-$1').replace(/[^0-9.-]/g, '');
-                        return parseFloat(val) || 0;
-                    };
-
-                    const debit = debitItem ? cleanNum(debitItem.text) : 0;
-                    const credit = creditItem ? cleanNum(creditItem.text) : 0;
-
-                    if (lastKnownBalance === null) {
-                        const origBal = cleanNum(balanceItem.originalText);
-                        const origDeb = debitItem ? cleanNum(debitItem.originalText) : 0;
-                        const origCre = creditItem ? cleanNum(creditItem.originalText) : 0;
-                        const opening = origBal - origCre + origDeb;
-                        lastKnownBalance = opening + credit - debit;
-                    } else {
-                        lastKnownBalance = lastKnownBalance + credit - debit;
-                    }
-
-                    const formattedBalance = lastKnownBalance.toLocaleString('en-IN', {
-                        minimumFractionDigits: 2,
-                        maximumFractionDigits: 2
+                    // Horizontally merge items that are very close to each other to fix pdf.js number splitting (e.g., "11,068." and "21")
+                    const sortedX = [...row].sort((a, b) => a.x - b.x);
+                    const mergedItems = [];
+                    let curMerged = null;
+                    
+                    sortedX.forEach(it => {
+                        if (!curMerged) {
+                            curMerged = { ...it };
+                        } else {
+                            const curEnd = curMerged.x + (curMerged.width || 0);
+                            const gap = it.x - curEnd;
+                            // 2.5pt gap strictly targets kerning/sub-space splits.
+                            if (gap < 2.5) { 
+                                curMerged.text += '' + (it.text || '');
+                                curMerged.width = (it.x + (it.width || 0)) - curMerged.x;
+                            } else {
+                                mergedItems.push(curMerged);
+                                curMerged = { ...it };
+                            }
+                        }
                     });
+                    if (curMerged) mergedItems.push(curMerged);
 
-                    // Update PDF Item
-                    if (balanceItem.text !== formattedBalance) {
-                        balanceItem.text = formattedBalance;
-                        balanceItem.hasChanged = true;
-                    }
+                    // BOUNDED COLUMN ASSIGNMENT: Fault-tolerant relative bucketing
+                    const rowItems = mergedItems.filter(it => {
+                        const text = (it.text || '').trim().toLowerCase();
+                        const cleanText = text.replace(/(?:cr|dr|c|d)\.?$/, '').trim();
+                        const isNumeric = /^[0-9,.\-\s()₹]+$/.test(cleanText) || cleanText === '-';
+                        // CRITICAL: Only accept numbers that physically reside in the amount columns area.
+                        // This prevents fragmented dates (like '2026' on the far left) from being mistaken as amounts.
+                        const isRightSide = it.x > activeStructure.boundaries.debitLeft;
+                        return isNumeric && isRightSide;
+                    });
+                    
+                    // CRITICAL: Sort by the center of the item, not the left edge. 
+                    // Right-aligned huge numbers expand to the left, which can invert sorting order if purely based on .x
+                    rowItems.sort((a, b) => {
+                        const aCenter = a.x + (a.width || 0) / 2;
+                        const bCenter = b.x + (b.width || 0) / 2;
+                        return aCenter - bCenter;
+                    });
+                    
+                    const columnAssignments = { debitItem: null, creditItem: null, balanceItem: null };
 
-                    // Also sync Debit/Credit values to PDF layer
-                    if (debitItem) {
-                        const formattedDebit = formatLikeOriginal(debit, debitItem.originalText);
-                        if (debitItem.text !== formattedDebit) {
-                            debitItem.text = formattedDebit;
-                            debitItem.hasChanged = true;
+                    if (rowItems.length > 0) {
+                        // The right-most item is almost always the balance
+                        columnAssignments.balanceItem = rowItems[rowItems.length - 1];
+
+                        // Determine standard order from header (e.g. Debit comes before Credit)
+                        const debitFirst = (activeStructure.debitX || 0) < (activeStructure.creditX || 9999);
+
+                        if (rowItems.length >= 3) {
+                            // If we have 3 numbers, they correspond to Debit, Credit, Balance (assuming one is '-')
+                            if (debitFirst) {
+                                columnAssignments.debitItem = rowItems[rowItems.length - 3];
+                                columnAssignments.creditItem = rowItems[rowItems.length - 2];
+                            } else {
+                                columnAssignments.creditItem = rowItems[rowItems.length - 3];
+                                columnAssignments.debitItem = rowItems[rowItems.length - 2];
+                            }
+                        } else if (rowItems.length === 2) {
+                            // If we have 2 numbers, one is the transaction amount, the other is balance
+                            const txnAmountItem = rowItems[0];
+                            const midX = activeStructure.boundaries.debitCredit;
+                            
+                            // CRITICAL: Use the CENTER of the item, not the left edge (x). 
+                            // Because numbers are right-aligned, a large Credit's left edge can cross the midpoint and be misclassified as a Debit.
+                            const itemCenter = txnAmountItem.x + (txnAmountItem.width || 0) / 2;
+
+                            // For 2 items, we still use the midpoint, but loosely (no absolute cutoffs)
+                            // If it's on the left of the midpoint, it's the left column
+                            if (itemCenter < midX) {
+                                if (debitFirst) columnAssignments.debitItem = txnAmountItem;
+                                else columnAssignments.creditItem = txnAmountItem;
+                            } else {
+                                if (debitFirst) columnAssignments.creditItem = txnAmountItem;
+                                else columnAssignments.debitItem = txnAmountItem;
+                            }
                         }
                     }
-                    if (creditItem) {
-                        const formattedCredit = formatLikeOriginal(credit, creditItem.originalText);
-                        if (creditItem.text !== formattedCredit) {
-                            creditItem.text = formattedCredit;
-                            creditItem.hasChanged = true;
-                        }
-                    }
 
-                    // Update Internal Transactions (Sync PDF -> Table)
-                    if (updatedInternalTxns[txnIdx]) {
-                        updatedInternalTxns[txnIdx].debit = debit;
-                        updatedInternalTxns[txnIdx].credit = credit;
-                        updatedInternalTxns[txnIdx].balance = lastKnownBalance.toFixed(2);
-                        txnIdx++;
+                    const { debitItem, creditItem, balanceItem } = columnAssignments;
+
+                    if (balanceItem) {
+                        const cleanNum = (txt) => {
+                            if (!txt || txt === '-' || txt.trim() === '') return 0;
+                            let val = txt.replace(/,/g, '').replace(/\((.*)\)/, '-$1').replace(/[^0-9.-]/g, '');
+                            return parseFloat(val) || 0;
+                        };
+
+                        let debit = debitItem ? cleanNum(debitItem.text) : 0;
+                        let credit = creditItem ? cleanNum(creditItem.text) : 0;
+                        const origBal = cleanNum(balanceItem.text); // Fixed: Use .text instead of undefined .originalText
+
+                        if (lastKnownBalance === null) {
+                            const origDeb = debitItem ? cleanNum(debitItem.text) : 0;
+                            const origCre = creditItem ? cleanNum(creditItem.text) : 0;
+                            const opening = origBal - origCre + origDeb;
+                            lastKnownBalance = opening + credit - debit;
+                            setTimeout(() => setDeducedOpeningBalance(opening), 0);
+                        } else {
+                            // Auto-correct swapped Debit/Credit if the math makes more sense
+                            const expectedNormal = lastKnownBalance + credit - debit;
+                            const expectedSwapped = lastKnownBalance + debit - credit;
+                            
+                            // Only swap if it perfectly matches the swapped math and doesn't match normal math
+                            if (Math.abs(origBal - expectedNormal) > 1 && Math.abs(origBal - expectedSwapped) <= 1) {
+                                const temp = debit;
+                                debit = credit;
+                                credit = temp;
+                                
+                                // Swap items for the UI layer too
+                                const tempItem = columnAssignments.debitItem;
+                                columnAssignments.debitItem = columnAssignments.creditItem;
+                                columnAssignments.creditItem = tempItem;
+                            }
+                            
+                            lastKnownBalance = lastKnownBalance + credit - debit;
+                        }
+
+                        const formattedBalance = lastKnownBalance.toLocaleString('en-IN', {
+                            minimumFractionDigits: 2,
+                            maximumFractionDigits: 2
+                        });
+
+                        if (balanceItem.text !== formattedBalance) {
+                            balanceItem.text = formattedBalance;
+                            balanceItem.hasChanged = true;
+                        }
+
+                        if (debitItem) {
+                            const formattedDebit = formatLikeOriginal(debit, debitItem.originalText);
+                            if (debitItem.text !== formattedDebit) {
+                                debitItem.text = formattedDebit;
+                                debitItem.hasChanged = true;
+                            }
+                        }
+                        if (creditItem) {
+                            const formattedCredit = formatLikeOriginal(credit, creditItem.originalText);
+                            if (creditItem.text !== formattedCredit) {
+                                creditItem.text = formattedCredit;
+                                creditItem.hasChanged = true;
+                            }
+                        }
+
+                        const rowTextJoined = row.map(it => it.text).join(' ');
+                        const dateMatch = rowTextJoined.match(/\d{1,2}[\/\-\s](?:[A-Za-z]{3}|\d{1,2})(?:[\/\-\s]\d{2,4})?/);
+                        const dateStr = dateMatch ? dateMatch[0] : '';
+                        
+                        const existingTxn = internalTransactions[newInternalTxns.length];
+                        const rawDescription = rowTextJoined.substring(rowTextJoined.indexOf(dateStr) + dateStr.length).replace(/[0-9,.\-\s()₹]+$/, '').trim();
+                        const description = existingTxn?.description && existingTxn.description.length > 3 ? existingTxn.description : (rawDescription.substring(0, 80) || 'Transaction');
+
+                        newInternalTxns.push({
+                            id: existingTxn?.id || `auto-${Math.random().toString(36).substr(2, 9)}`,
+                            date: existingTxn?.date || dateStr,
+                            valueDate: existingTxn?.valueDate || dateStr,
+                            description: description,
+                            reference: existingTxn?.reference || '',
+                            debit: debit,
+                            credit: credit,
+                            balance: lastKnownBalance.toFixed(2)
+                        });
                     }
+                } catch (rowErr) {
+                    console.warn("[runAutoCalculation] Skipping problematic row:", rowErr);
                 }
             });
 
-            if (updatedInternalTxns.length > 0) {
-                setInternalTransactions(updatedInternalTxns);
+            // Only use visual parser transactions if backend didn't provide any
+            // Backend extraction is more accurate for protected PDFs
+            if (newInternalTxns.length > 0 && (!initialTransactions || initialTransactions.length === 0)) {
+                console.log('[VISUAL_PARSER] Using visual parser data (no backend data)');
+                setInternalTransactions(newInternalTxns);
+            } else if (initialTransactions && initialTransactions.length > 0) {
+                console.log('[VISUAL_PARSER] Keeping backend data, visual parser ignored');
             }
 
             return nextPages.map(page => ({
@@ -260,9 +393,17 @@ export function InPdfEditor(props) {
     useEffect(() => {
         const loadPdf = async () => {
             setIsLoading(true);
+            // Reset state for new file
+            setTableStructure(null);
+            setPagesData([]);
+            setDeducedOpeningBalance(0);
+            setInternalTransactions(initialTransactions || []); // Initialize with backend fallback data for the NEW file, preventing old file bleed
+
             try {
-                setPagesData([]);
-                const loadingTask = pdfjsLib.getDocument(fileUrl);
+                const loadingTask = pdfjsLib.getDocument({
+                    url: fileUrl,
+                    password: password || undefined
+                });
                 const loadedPdf = await loadingTask.promise;
                 setPdf(loadedPdf);
                 setNumPages(loadedPdf.numPages);
@@ -382,6 +523,7 @@ export function InPdfEditor(props) {
                             height: item.height || fontSize,
                             fontSize: fontSize,
                             fontName: item.fontName,
+                            pageIdx: i, // CRITICAL: Required for cross-page sorting
                             hasChanged: false
                         };
                     });
@@ -394,8 +536,19 @@ export function InPdfEditor(props) {
                         items: items.filter(item => item.text.trim().length > 0)
                     });
                 }
+                console.log(`[PDF_LOAD] Total pages loaded: ${allPagesData.length}`);
+                console.log(`[PDF_LOAD] Pages data:`, allPagesData.map(p => ({ pageIndex: p.pageIndex, itemCount: p.items.length })));
                 setPagesData(allPagesData);
-                analyzeTableStructure(allPagesData);
+                const structure = analyzeTableStructure(allPagesData);
+                
+                // Immediately reconstruct transactions using the visual table structure
+                if (structure) {
+                    // Because React state updates are asynchronous, we pass the structure explicitly
+                    // to avoid the stale closure problem.
+                    setTimeout(() => {
+                        runAutoCalculation(allPagesData, structure);
+                    }, 0);
+                }
             } catch (error) {
                 console.error("Error loading PDF:", error);
                 alert("Failed to load PDF for editing.");
@@ -405,7 +558,7 @@ export function InPdfEditor(props) {
         };
 
         if (fileUrl) loadPdf();
-    }, [fileUrl, fileVersion]);
+    }, [fileUrl, fileVersion, password]);
 
     const handleTextChange = (pageIdx, itemId, newText) => {
         setPagesData(current => {
@@ -459,7 +612,7 @@ export function InPdfEditor(props) {
                 const firstItem = row[0];
                 if (!firstItem) return false;
                 const isAfterHeaderPage = firstItem.pageIdx > tableStructure.pageIndex;
-                const isOnHeaderPageBelowHeader = firstItem.pageIdx === tableStructure.pageIndex && firstItem.y < tableStructure.headerY - 10;
+                const isOnHeaderPageBelowHeader = firstItem.pageIdx === tableStructure.pageIndex && firstItem.y < tableStructure.headerY + 10;
                 if (!isAfterHeaderPage && !isOnHeaderPageBelowHeader) return false;
 
                 const rowText = row.map(it => (it.text || '').toLowerCase()).join(' ');
@@ -523,7 +676,7 @@ export function InPdfEditor(props) {
         if (!fileUrl) return;
         try {
             const fileName = fileUrl.split('/').pop() || 'statement.pdf';
-            const downloadUrl = `https://statsedit-api.onrender.com/api/statements/download-file?fileUrl=${encodeURIComponent(fileUrl)}`;
+            const downloadUrl = `/api/statements/download-file?fileUrl=${encodeURIComponent(fileUrl)}`;
             const response = await fetch(downloadUrl);
             if (!response.ok) throw new Error(`Server returned ${response.status}`);
             const blob = await response.blob();
@@ -580,7 +733,7 @@ export function InPdfEditor(props) {
         }
 
         try {
-            const response = await fetch('https://statsedit-api.onrender.com/api/statements/edit-direct', {
+            const response = await fetch('/api/statements/edit-direct', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -648,7 +801,7 @@ export function InPdfEditor(props) {
 
             // Helper: parse a numeric string from PDF text (handles commas, dashes, parentheses)
             const cleanOrigNum = (txt) => {
-                if (!txt || txt === '-' || txt.trim() === '') return 0;
+                if (txt === null || txt === undefined || txt === '-' || String(txt).trim() === '') return 0;
                 const val = String(txt).replace(/,/g, '').replace(/\((.*)\)/, '-$1').replace(/[^0-9.-]/g, '');
                 return parseFloat(val) || 0;
             };
@@ -691,7 +844,7 @@ export function InPdfEditor(props) {
                 const firstItem = row[0];
                 if (!firstItem) return false;
                 const isAfterHeaderPage = firstItem.pageIdx > tableStructure.pageIndex;
-                const isOnHeaderPageBelowHeader = firstItem.pageIdx === tableStructure.pageIndex && firstItem.y < tableStructure.headerY - 10;
+                const isOnHeaderPageBelowHeader = firstItem.pageIdx === tableStructure.pageIndex && firstItem.y < tableStructure.headerY + 10;
                 if (!isAfterHeaderPage && !isOnHeaderPageBelowHeader) return false;
 
                 const rowText = row.map(it => (it.text || '').toLowerCase()).join(' ');
@@ -830,10 +983,51 @@ export function InPdfEditor(props) {
                     const rowText = row.map(it => it.text.toLowerCase()).join(' ');
                     const isOpening = /opening.*balance/i.test(rowText);
                     const isClosing = /closing.*balance/i.test(rowText);
-                    if (!isOpening && !isClosing) return;
+                    const isTotal = /total/i.test(rowText);
+                    if (!isOpening && !isClosing && !isTotal) return;
 
+                    // If it's a Total row, we might have multiple numbers (Total Debit, Total Credit).
+                    if (isTotal) {
+                        const newDebitSum = editedTxns.reduce((sum, t) => sum + cleanOrigNum(t.debit), 0);
+                        const newCreditSum = editedTxns.reduce((sum, t) => sum + cleanOrigNum(t.credit), 0);
+
+                        const numItems = row.filter(it => /^[0-9,.\-\s()₹]+$/.test(it.text.trim()) && cleanOrigNum(it.originalText) > 0);
+                        numItems.forEach(best => {
+                            let targetVal = null;
+
+                            // Use column proximity to determine which sum to apply
+                            const mid = best.x + (best.width || 0) / 2;
+                            const isDebitCol = mid > tableStructure.boundaries.debitLeft && mid < tableStructure.boundaries.debitCredit;
+                            const isCreditCol = mid >= tableStructure.boundaries.debitCredit && mid < tableStructure.boundaries.creditBalance;
+
+                            if (isDebitCol) targetVal = newDebitSum;
+                            else if (isCreditCol) targetVal = newCreditSum;
+
+                            if (targetVal !== null) {
+                                const formatted = formatLikeOriginal(normalizeNum(targetVal), best.originalText);
+                                if (best.originalText === formatted) return;
+
+                                summaryUpdates.push({
+                                    pageIndex: page.pageIndex,
+                                    x: best.x,
+                                    y: best.y,
+                                    width: best.width,
+                                    height: best.height,
+                                    fontSize: best.fontSize,
+                                    newText: formatted,
+                                    isNumeric: true,
+                                    isBold: false, // Total amounts are typically regular font weight
+                                    isSummaryItem: true,
+                                    maskColor: [0.92, 0.92, 0.92] // Light grey background for Total row
+                                });
+                            }
+                        });
+                        return; // Done with total row
+                    }
+
+                    // For Opening / Closing Balance
                     const targetVal = isOpening
-                        ? initialBalances?.opening
+                        ? (deducedOpeningBalance !== null ? deducedOpeningBalance : initialBalances?.opening)
                         : (tableClosingBalance ?? initialBalances?.closing);
                     if (targetVal === null || targetVal === undefined) return;
 
@@ -943,7 +1137,7 @@ export function InPdfEditor(props) {
             }
 
             console.log(`[handleTransformWithPrecision] Submitting ${changes.length} changes to backend...`);
-            const response = await fetch('https://statsedit-api.onrender.com/api/statements/edit-direct', {
+            const response = await fetch('/api/statements/edit-direct', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ fileUrl, changes }),
@@ -1034,7 +1228,7 @@ export function InPdfEditor(props) {
 
             <div className="flex-1 overflow-auto p-6 md:p-12 flex flex-col items-center gap-8 custom-scrollbar scroll-smooth bg-slate-50/50" ref={containerRef}>
                 {viewMode === 'pdf' ? (
-                    <div className="relative w-full flex flex-col items-center gap-8">
+                    <div className="w-full flex flex-col items-center gap-8 min-h-full">
                         <AnimatePresence>
                             {isTransforming && (
                                 <motion.div
@@ -1061,21 +1255,26 @@ export function InPdfEditor(props) {
                             )}
                         </AnimatePresence>
 
-                        {pagesData.map((pageData) => (
-                            <PageItem
-                                key={`${pageData.pageIndex}-${fileUrl}`}
-                                pdf={pdf}
-                                pageData={pageData}
-                                scale={scale}
-                                readOnly={true}
-                            />
-                        ))}
+                        {pagesData.map((pageData, idx) => {
+                            console.log(`[RENDER] Page ${(idx + 1)}/${pagesData.length} (pageIndex: ${pageData.pageIndex}) rendering`);
+                            return (
+                                <div key={`${pageData.pageIndex}-${fileUrl}`} className="w-full mb-8">
+                                    <PageItem
+                                        pdf={pdf}
+                                        pageData={pageData}
+                                        scale={scale}
+                                        readOnly={true}
+                                    />
+                                </div>
+                            );
+                        })}
                     </div>
                 ) : (
                     <div className="w-full max-w-6xl animate-in">
                         <TransactionTable
+                            key={`${fileUrl}-${password || ''}`}
                             transactions={internalTransactions}
-                            openingBalance={initialBalances?.opening}
+                            openingBalance={deducedOpeningBalance !== null ? deducedOpeningBalance : initialBalances?.opening}
                             closingBalance={initialBalances?.closing}
                             fileUrl={fileUrl}
                             onUpdateFileUrl={onUpdateFileUrl}
@@ -1092,34 +1291,56 @@ export function InPdfEditor(props) {
 
 function PageItem({ pdf, pageData, scale, onTextChange, readOnly = false }) {
     const canvasRef = useRef(null);
+    const renderTaskRef = useRef(null);
     const [scaledViewport, setScaledViewport] = useState(null);
+    const [isRendered, setIsRendered] = useState(false);
 
     useEffect(() => {
-        let currentRenderTask = null;
+        let isCancelled = false;
 
         const renderPage = async () => {
             if (!pdf || !canvasRef.current) return;
 
+            // Cancel any previous render task
+            if (renderTaskRef.current) {
+                renderTaskRef.current.cancel();
+                try {
+                    await renderTaskRef.current.promise;
+                } catch (e) {
+                    // Ignore cancellation errors
+                }
+                renderTaskRef.current = null;
+            }
+
+            if (isCancelled) return;
+
             try {
                 const page = await pdf.getPage(pageData.pageIndex);
+                if (isCancelled) return;
+
                 const viewport = page.getViewport({ scale });
                 setScaledViewport(viewport);
 
                 const canvas = canvasRef.current;
-                const context = canvas.getContext('2d', { alpha: false });
-
+                // Reset canvas to prevent "same canvas" error
                 canvas.height = viewport.height;
                 canvas.width = viewport.width;
 
-                currentRenderTask = page.render({
+                const context = canvas.getContext('2d', { alpha: false });
+                // Clear canvas before rendering
+                context.clearRect(0, 0, canvas.width, canvas.height);
+
+                renderTaskRef.current = page.render({
                     canvasContext: context,
                     viewport: viewport
                 });
 
-                await currentRenderTask.promise;
+                await renderTaskRef.current.promise;
+                renderTaskRef.current = null;
+                setIsRendered(true);
+                console.log(`[PageItem] Page ${pageData.pageIndex} rendered successfully`);
             } catch (error) {
                 if (error.name === 'RenderingCancelledException') {
-                    // Ignore cancellation errors as they are expected when zooming/scrolling
                     return;
                 }
                 console.error("PDF Render Error:", error);
@@ -1129,8 +1350,9 @@ function PageItem({ pdf, pageData, scale, onTextChange, readOnly = false }) {
         renderPage();
 
         return () => {
-            if (currentRenderTask) {
-                currentRenderTask.cancel();
+            isCancelled = true;
+            if (renderTaskRef.current) {
+                renderTaskRef.current.cancel();
             }
         };
     }, [pdf, pageData.pageIndex, scale]);

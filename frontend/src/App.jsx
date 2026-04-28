@@ -18,6 +18,9 @@ function App() {
   const [uploadedFileUrl, setUploadedFileUrl] = useState(() => {
     return sessionStorage.getItem('pdf_fileUrl') || null;
   });
+  const [pdfPassword, setPdfPassword] = useState(() => {
+    return sessionStorage.getItem('pdf_password') || null;
+  });
   const [currentTransactions, setCurrentTransactions] = useState(() => {
     try { return JSON.parse(sessionStorage.getItem('pdf_transactions')) || []; } catch { return []; }
   });
@@ -34,6 +37,11 @@ function App() {
     if (uploadedFileUrl) sessionStorage.setItem('pdf_fileUrl', uploadedFileUrl);
     else sessionStorage.removeItem('pdf_fileUrl');
   }, [uploadedFileUrl]);
+
+  React.useEffect(() => {
+    if (pdfPassword) sessionStorage.setItem('pdf_password', pdfPassword);
+    else sessionStorage.removeItem('pdf_password');
+  }, [pdfPassword]);
 
   React.useEffect(() => {
     sessionStorage.setItem('pdf_transactions', JSON.stringify(currentTransactions));
@@ -57,11 +65,13 @@ function App() {
     localStorage.removeItem('fin_auth_data');
     sessionStorage.removeItem('pdf_step');
     sessionStorage.removeItem('pdf_fileUrl');
+    sessionStorage.removeItem('pdf_password');
     sessionStorage.removeItem('pdf_transactions');
     sessionStorage.removeItem('pdf_balances');
     setIsAuthenticated(false);
     setStep('upload');
     setUploadedFileUrl(null);
+    setPdfPassword(null);
     setCurrentTransactions([]);
     setBalances({ opening: 0, closing: 0 });
   };
@@ -77,10 +87,11 @@ function App() {
     return () => window.removeEventListener('nav-to-upload', handleNav);
   }, []);
 
-  const handleUpload = (file, fileUrl, transactions, openingBalance, closingBalance) => {
+  const handleUpload = (file, fileUrl, transactions, openingBalance, closingBalance, password) => {
     // If backend returns a URL, use it, otherwise fallback to local blob for preview
     const finalUrl = fileUrl || URL.createObjectURL(file);
     setUploadedFileUrl(finalUrl);
+    setPdfPassword(password || null);
     setCurrentTransactions(transactions || []);
     setBalances({ 
       opening: openingBalance || 0, 
@@ -150,6 +161,7 @@ function App() {
           >
             <InPdfEditor
               fileUrl={uploadedFileUrl}
+              password={pdfPassword}
               onUpdateFileUrl={setUploadedFileUrl}
               initialTransactions={currentTransactions}
               initialBalances={balances}

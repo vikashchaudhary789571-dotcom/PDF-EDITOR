@@ -2,7 +2,10 @@ const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
 const { PDFDocument, rgb, StandardFonts, PDFName, PDFArray } = require('pdf-lib');
-const { PDFParse } = require('pdf-parse');
+const qpdf = require('node-qpdf2');
+// pdf-parse v2.x exports PDFParse class
+const pdfParseModule = require('pdf-parse');
+const PDFParse = pdfParseModule.PDFParse || pdfParseModule;
 
 /**
  * Decode a pdf-lib stream object's raw bytes.
@@ -90,37 +93,43 @@ function extractPageTextColor(pdfDoc, page) {
 }
 
 exports.uploadStatement = async (req, res) => {
+    console.log('[uploadStatement] FUNCTION CALLED - checking req.file:', !!req.file);
+    
     if (!req.file) {
+        console.log('[uploadStatement] ERROR: No file in req.file');
         return res.status(400).json({ success: false, message: 'No file uploaded' });
     }
 
     try {
         const filePath = path.join(__dirname, '../uploads', req.file.filename);
+        console.log('[uploadStatement] File path:', filePath);
+        
         let dataBuffer = fs.readFileSync(filePath);
         const password = req.body.password;
 
         console.log('[uploadStatement] Starting PDF processing, password provided:', !!password);
+        console.log('[uploadStatement] File size:', dataBuffer.length, 'bytes');
 
-        // If password is provided, decrypt with pdf-lib and save the decrypted version
-        // This allows both pdf-parse and the frontend PDF.js to read it without issues
+        // NOTE: If a password is provided, we validate it first using pdf-parse.
+        // We do NOT decrypt the file on disk — the frontend pdfjs viewer handles
+        // the encrypted file natively using the password passed from props.
+        // This avoids dependency on qpdf binary or pdf-lib's broken decryption.
         if (password) {
             try {
-                console.log('[uploadStatement] Decrypting PDF with pdf-lib...');
-                const pdfDoc = await PDFDocument.load(dataBuffer, {
-                    password: password,
-                    ignoreEncryption: true  // Use lenient mode for better compatibility
-                });
-                
-                // Save the decrypted PDF
-                dataBuffer = await pdfDoc.save();
-                fs.writeFileSync(filePath, dataBuffer);
-                console.log('[uploadStatement] PDF decrypted and saved successfully');
-            } catch (decryptErr) {
-                console.error('[uploadStatement] PDF decryption failed:', decryptErr.message);
-                return res.status(400).json({
-                    success: false,
-                    message: 'Incorrect password or failed to decrypt PDF. Please check the password and try again.'
-                });
+                const testParser = new PDFParse({ data: dataBuffer, password: password });
+                await testParser.getText(); // Will throw PasswordException if wrong password
+                console.log('[uploadStatement] Password validated successfully via pdf-parse');
+            } catch (validErr) {
+                const msg = validErr.message || '';
+                if (msg.toLowerCase().includes('password') || msg.toLowerCase().includes('encrypt')) {
+                    console.error('[uploadStatement] Wrong password:', msg);
+                    return res.status(400).json({
+                        success: false,
+                        message: 'Incorrect password or failed to decrypt PDF.'
+                    });
+                }
+                // Other parse error — not a password issue, continue anyway
+                console.warn('[uploadStatement] Non-password parse error during validation, continuing:', msg);
             }
         }
 
@@ -132,42 +141,29 @@ exports.uploadStatement = async (req, res) => {
         try {
             console.log('[uploadStatement] Creating PDFParse with buffer size:', dataBuffer.length);
             
-            // Try parsing - if it still complains about password, pass it anyway
-            const parseOptions = { data: dataBuffer };
-            if (password) {
-                // Even though we decrypted, pdf-parse might still need the password
-                parseOptions.password = password;
-            }
+            // The dataBuffer is now ready; pass password if provided so pdf-parse can decrypt
+            const parseOptions = { data: dataBuffer, password: password || '' };
             
             parser = new PDFParse(parseOptions);
             const textResult = await parser.getText();
             text = textResult.text || '';
-            console.log('[uploadStatement] PDFParse getText successful, text length:', text.length);
+            console.log(`[uploadStatement] PDFParse getText successful, text length: ${text.length}`);
+            console.log(`[uploadStatement] Text sample (first 500 chars): ${text.substring(0, 500)}`);
+            console.log(`[uploadStatement] Text sample (last 500 chars): ${text.substring(text.length - 500)}`);
         } catch (parseErr) {
-            console.error('[uploadStatement] PDFParse getText failed:', parseErr.message);
-            
-            // If we have a password and it still failed, try WITHOUT the password
-            // (the decrypted buffer should work without it)
-            if (password && (parseErr.message.includes('password') || parseErr.message.includes('No password'))) {
-                console.log('[uploadStatement] Retrying PDFParse without password on decrypted buffer...');
-                try {
-                    parser = new PDFParse({ data: dataBuffer });
-                    const textResult = await parser.getText();
-                    text = textResult.text || '';
-                    console.log('[uploadStatement] PDFParse retry successful, text length:', text.length);
-                } catch (retryErr) {
-                    console.error('[uploadStatement] PDFParse retry also failed:', retryErr.message);
-                    return res.status(500).json({
-                        success: false,
-                        message: 'Failed to parse PDF: ' + retryErr.message
-                    });
-                }
-            } else {
-                return res.status(500).json({
+            console.error('[uploadStatement] PDFParse error:', parseErr);
+            const errMsg = parseErr.message || '';
+            // PasswordException means either no password given or wrong one
+            if (errMsg.toLowerCase().includes('password') || errMsg.toLowerCase().includes('encrypt') || parseErr.name === 'PasswordException') {
+                return res.status(400).json({
                     success: false,
-                    message: 'Failed to parse PDF: ' + parseErr.message
+                    message: 'This PDF is password-protected. Please enter the password to process it.'
                 });
             }
+            return res.status(500).json({
+                success: false,
+                message: 'Failed to parse PDF: ' + errMsg
+            });
         }
 
         // --- SEARCHING BALANCES ---
@@ -178,61 +174,462 @@ exports.uploadStatement = async (req, res) => {
         let openingBalance = obMatch ? parseFloat(obMatch[1].replace(/,/g, '')) : null;
         let closingBalance = cbMatch ? parseFloat(cbMatch[1].replace(/,/g, '')) : null;
 
-        // --- EXTRACTING TABLE ---
-        try {
-            tableResult = await parser.getTable();
-        } catch (tableErr) {
-            console.warn('[uploadStatement] pdf-parse getTable failed, trying to continue without tables:', tableErr.message);
-            tableResult = { pages: [] }; // Mock empty pages to avoid crashing below
-        }
+        // --- EXTRACTING TRANSACTIONS FROM TEXT ---
+        // pdf-parse v2.x doesn't have getTable() - parse from text instead
         const transactions = [];
 
-        if (tableResult.pages && tableResult.pages.length > 0) {
-            tableResult.pages.forEach((page) => {
-                page.tables.forEach((table) => {
-                    table.forEach(row => {
-                        // Pattern for date (covers dd/mm/yyyy, dd-mm-yyyy, dd MMM yyyy)
-                        const firstCol = row[0] ? String(row[0]).trim() : '';
-                        if (/^\d{1,2}[\/\-\s][a-zA-Z0-9]{2,3}[\/\-\s]\d{2,4}/.test(firstCol)) {
-                            // Map row to transaction object
-                            // Assuming typical statement structure: Date, Description, [optional ref], Debit, Credit, Balance
-                            // We need to detect which columns are which
-                            // For now, let's use a heuristic based on the length
+        // Detect bank type from text
+        const isSBI = text.toLowerCase().includes('state bank of india') || text.toLowerCase().includes('sbi');
+        const isAU = text.toLowerCase().includes('au small finance bank') || text.toLowerCase().includes('au bank');
 
-                            let transactionDate = row[0];
-                            let valueDate = row[1] || '';
-                            let description = row[2] || '';
-                            let reference = row[3] || '';
-                            let debit = 0;
-                            let credit = 0;
-                            let balance = 0;
+        console.log(`[BANK_DETECT] SBI: ${isSBI}, AU: ${isAU}`);
 
-                            if (row.length >= 7) {
-                                // Date, Value Date, Description, Ref, Debit, Credit, Balance
-                                debit = parseFloat(String(row[4] || '').replace(/,/g, '')) || 0;
-                                credit = parseFloat(String(row[5] || '').replace(/,/g, '')) || 0;
-                                balance = parseFloat(String(row[6] || '').replace(/,/g, '')) || 0;
-                            } else if (row.length >= 5) {
-                                // Fallback to simpler structure if 7 aren't found
-                                debit = parseFloat(String(row[row.length - 3] || '').replace(/,/g, '')) || 0;
-                                credit = parseFloat(String(row[row.length - 2] || '').replace(/,/g, '')) || 0;
-                                balance = parseFloat(String(row[row.length - 1] || '').replace(/,/g, '')) || 0;
+        // Parse transactions from text lines
+        // Support multiple date formats: dd/mm/yy, dd-mm-yyyy, dd.mm.yyyy, dd Mmm yy, etc.
+        const lines = text.split('\n').filter(line => line.trim());
+
+        // More flexible date patterns - prioritize SBI format (dd/mm/yyyy)
+        const datePatterns = [
+            /(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})/,     // dd/mm/yyyy (SBI format)
+            /(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2})/,     // dd/mm/yy
+            /(\d{1,2}\.\d{1,2}\.\d{4})/,            // dd.mm.yyyy
+            /(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})/,      // 26 Apr 2024
+            /(\d{1,2}\s+[A-Za-z]{3,}\s+\d{2,4})/,   // 26 April 2024
+            /(\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2})/,    // yyyy/mm/dd
+        ];
+        
+        const amountPattern = /[\d,]+\.\d{2}/g;
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            
+            // Try all date patterns
+            let dateMatch = null;
+            for (const pattern of datePatterns) {
+                dateMatch = line.match(pattern);
+                if (dateMatch) break;
+            }
+
+            if (dateMatch) {
+                // Extract all amounts from this line - but filter out reference numbers
+                const allAmountMatches = [...line.matchAll(amountPattern)];
+                const amounts = [];
+                
+                for (const match of allAmountMatches) {
+                    const num = parseFloat(match[0].replace(/,/g, ''));
+                    // Filter: amounts should be between 0 and 100 crore (reasonable transaction range)
+                    if (num > 0 && num < 1000000000) {
+                        amounts.push(num);
+                    }
+                }
+
+                // DEBUG: Log each date line and extracted amounts
+                if (amounts.length >= 2 && transactions.length < 5) {
+                    console.log(`[DEBUG] Line ${i}: "${line.substring(0, 80)}..."`);
+                    console.log(`[DEBUG]   Date match: ${dateMatch[0]}`);
+                    console.log(`[DEBUG]   Raw amounts found: ${allAmountMatches.map(m => m[0]).join(', ')}`);
+                    console.log(`[DEBUG]   Filtered amounts: ${amounts.join(', ')}`);
+                }
+
+                if (amounts.length >= 2) {
+                    // Last amount is typically balance
+                    const balance = amounts[amounts.length - 1];
+                    
+                    // For bank statements, typically we have: [debit] [credit] [balance] or [amount] [balance]
+                    let debit = 0, credit = 0;
+                    
+                    const lineLower = line.toLowerCase();
+                    // Check for CR/DR indicators in description (NEFT CR-, NEFT DR-, etc.) using word boundaries
+                    const hasCR = /\b(cr|credit|cr\-)\b/.test(lineLower);
+                    const hasDR = /\b(dr|debit|dr\-)\b/.test(lineLower);
+                    
+                    // DEBUG: Log CR/DR detection
+                    if (transactions.length < 5) {
+                        console.log(`[DEBUG]   hasCR: ${hasCR}, hasDR: ${hasDR}, amounts.length: ${amounts.length}`);
+                    }
+                    
+                    if (amounts.length >= 3) {
+                        // Format: debit, credit, balance
+                        // Check CR/DR indicators to determine which is which
+                        if (hasCR && !hasDR) {
+                            // Credit transaction - amount before balance is the credit
+                            credit = amounts[amounts.length - 3];
+                            debit = amounts[amounts.length - 2];
+                        } else if (hasDR && !hasCR) {
+                            // Debit transaction
+                            debit = amounts[amounts.length - 3];
+                            credit = amounts[amounts.length - 2];
+                        } else {
+                            // Default: assume debit, credit, balance order
+                            debit = amounts[amounts.length - 3];
+                            credit = amounts[amounts.length - 2];
+                        }
+                    } else if (amounts.length === 2) {
+                        // Format: amount, balance - need to determine if debit or credit
+                        const amount = amounts[0];
+                        if (hasCR) {
+                            credit = amount;
+                        } else if (hasDR) {
+                            debit = amount;
+                        } else {
+                            // Default: check if balance increased or decreased from previous transaction
+                            let prevBalance = null;
+                            if (transactions.length > 0) {
+                                prevBalance = parseFloat(String(transactions[transactions.length - 1].balance).replace(/,/g, ''));
+                            } else if (openingBalance !== null) {
+                                prevBalance = openingBalance;
+                            }
+                            
+                            if (prevBalance !== null) {
+                                // If current balance > prev balance, it's a credit
+                                if (balance > prevBalance) {
+                                    credit = amount;
+                                } else {
+                                    debit = amount;
+                                }
+                            } else {
+                                // Ultimate fallback
+                                credit = amount;
+                            }
+                        }
+                    }
+
+                    // DEBUG: Log extracted transaction details
+                    if (transactions.length < 5) {
+                        console.log(`[DEBUG]   Extracted -> Debit: ${debit}, Credit: ${credit}, Balance: ${balance}`);
+                    }
+
+                    // Extract description (everything between date and first amount)
+                    const dateEnd = line.indexOf(dateMatch[0]) + dateMatch[0].length;
+                    const firstAmountIdx = line.search(amountPattern);
+                    let description = '';
+                    
+                    if (firstAmountIdx > dateEnd) {
+                        description = line.substring(dateEnd, firstAmountIdx).trim();
+                    }
+
+                    // Clean up description - remove common non-description text
+                    description = description
+                        .replace(/\s+/g, ' ')
+                        .replace(/^(\.|\-|\s)+/, '')
+                        .substring(0, 100);
+
+                    // Only add if we have a valid description or the line has meaningful content
+                    if (description.length > 2 || amounts.length >= 2) {
+                        transactions.push({
+                            id: Math.random().toString(36).substr(2, 9),
+                            date: dateMatch[0],
+                            valueDate: dateMatch[0],
+                            description: description || 'Transaction',
+                            reference: '',
+                            debit: debit,
+                            credit: credit,
+                            balance: balance
+                        });
+                    }
+                }
+            }
+        }
+
+        console.log(`[uploadStatement] Extracted ${transactions.length} transactions from text`);
+        
+        // DEBUG: Log first few transactions to verify extraction
+        if (transactions.length > 0) {
+            console.log('[uploadStatement] First 3 extracted transactions:');
+            transactions.slice(0, 3).forEach((t, i) => {
+                console.log(`  [${i+1}] Date: ${t.date}, Debit: ${t.debit}, Credit: ${t.credit}, Balance: ${t.balance}`);
+                console.log(`      Desc: ${t.description?.substring(0, 50)}`);
+            });
+        }
+        
+        // If no transactions found or few transactions, try bank-specific parsing
+        if (transactions.length === 0 || transactions.length < 3) {
+            if (isSBI) {
+                console.log('[uploadStatement] Trying SBI Bank specific parsing...');
+
+                // SBI Bank format: dd/mm/yyyy format with specific amount placement
+                const sbiDatePattern = /(\d{1,2}\/\d{1,2}\/\d{4})/;
+
+                // Clear previous transactions if we had few
+                if (transactions.length > 0 && transactions.length < 3) {
+                    console.log('[uploadStatement] Clearing suspicious transactions, restarting with SBI Bank parser');
+                    transactions.length = 0;
+                }
+
+                for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i].trim();
+
+                    // Check for SBI date format: "01/01/2024"
+                    const dateMatch = line.match(sbiDatePattern);
+
+                    if (dateMatch) {
+                        // Skip header lines
+                        const lineLower = line.toLowerCase();
+                        if (lineLower.includes('opening balance') ||
+                            lineLower.includes('closing balance') ||
+                            lineLower.includes('statement period') ||
+                            lineLower.includes('account number') ||
+                            lineLower.includes('customer id') ||
+                            lineLower.includes('page')) {
+                            continue;
+                        }
+
+                        // Extract amounts from current line
+                        const allAmountMatches = [...line.matchAll(/[\d,]+\.\d{2}/g)];
+                        const amounts = [];
+
+                        for (const match of allAmountMatches) {
+                            const num = parseFloat(match[0].replace(/,/g, ''));
+                            if (num > 0 && num < 1000000000) {
+                                amounts.push(num);
+                            }
+                        }
+
+                        if (amounts.length >= 2) {
+                            console.log(`[SBI_DEBUG] Line ${i}: "${line.substring(0, 80)}..."`);
+                            console.log(`[SBI_DEBUG] Amounts: ${amounts.join(', ')}`);
+
+                            // SBI format: typically [amount] [balance] with CR/DR indicators
+                            const balance = amounts[amounts.length - 1];
+                            let debit = 0, credit = 0;
+
+                            // Check for CR/DR indicators in the line
+                            const hasCR = /\bCR\b|\bcr\b/.test(line);
+                            const hasDR = /\bDR\b|\bdr\b/.test(line);
+
+                            if (amounts.length === 2) {
+                                // Format: amount, balance
+                                const amount = amounts[0];
+                                if (hasCR) {
+                                    credit = amount;
+                                } else if (hasDR) {
+                                    debit = amount;
+                                } else {
+                                    // Try to determine from balance change
+                                    let prevBalance = null;
+                                    if (transactions.length > 0) {
+                                        prevBalance = transactions[transactions.length - 1].balance;
+                                    } else if (openingBalance !== null) {
+                                        prevBalance = openingBalance;
+                                    }
+
+                                    if (prevBalance !== null) {
+                                        if (balance > prevBalance) {
+                                            credit = amount;
+                                        } else {
+                                            debit = amount;
+                                        }
+                                    } else {
+                                        credit = amount; // Default to credit
+                                    }
+                                }
+                            } else if (amounts.length >= 3) {
+                                // Format: debit, credit, balance
+                                debit = amounts[0];
+                                credit = amounts[1];
                             }
 
-                            transactions.push({
-                                id: Math.random().toString(36).substr(2, 9),
-                                date: transactionDate,
-                                valueDate,
-                                description,
-                                reference,
-                                debit,
-                                credit,
-                                balance
-                            });
+                            // Extract description
+                            const dateEnd = line.indexOf(dateMatch[0]) + dateMatch[0].length;
+                            const firstAmountIdx = line.search(/[\d,]+\.\d{2}/);
+                            let description = '';
+
+                            if (firstAmountIdx > dateEnd) {
+                                description = line.substring(dateEnd, firstAmountIdx).trim();
+                            }
+
+                            description = description
+                                .replace(/\s+/g, ' ')
+                                .replace(/^(CR|DR|\.|\-|\s)+/, '')
+                                .substring(0, 100);
+
+                            if (description.length > 2 || amounts.length >= 2) {
+                                transactions.push({
+                                    id: Math.random().toString(36).substr(2, 9),
+                                    date: dateMatch[0],
+                                    valueDate: dateMatch[0],
+                                    description: description || 'Transaction',
+                                    reference: '',
+                                    debit: debit,
+                                    credit: credit,
+                                    balance: balance
+                                });
+
+                                console.log(`[SBI_DEBUG] Added transaction: Debit ${debit}, Credit ${credit}, Balance ${balance}`);
+                            }
                         }
-                    });
-                });
-            });
+                    }
+                }
+            }
+
+            // Try AU Bank specific parsing if SBI didn't work or if it's AU bank
+            if (transactions.length === 0 || (!isSBI && isAU)) {
+                console.log('[uploadStatement] Trying AU Bank specific parsing...');
+            
+            // AU Bank format: multiline transactions with date like "01 Aug 2025"
+            const auDatePattern = /(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})/;
+            
+            // Clear previous transactions if we had few
+            if (transactions.length > 0 && transactions.length < 3) {
+                console.log('[uploadStatement] Clearing suspicious transactions, restarting with AU Bank parser');
+                transactions.length = 0;
+            }
+            
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i].trim();
+                
+                // Check for AU Bank date format: "01 Aug 2025"
+                const dateMatch = line.match(auDatePattern);
+                
+                if (dateMatch) {
+                    // DEBUG: Log ALL date matches to see what's being processed
+                    if (transactions.length < 5) {
+                        console.log(`[AU_TRACE] Line ${i}: "${line.substring(0, 60)}..."`);
+                    }
+                    
+                    // Skip statement header lines - look for keywords that indicate this is not a transaction
+                    const lineLower = line.toLowerCase();
+                    if (lineLower.includes('statement period') || 
+                        lineLower.includes('opening balance') || 
+                        lineLower.includes('closing balance') ||
+                        lineLower.includes('account number') ||
+                        lineLower.includes('customer id')) {
+                        if (transactions.length < 5) {
+                            console.log(`[AU_TRACE]   -> SKIPPED (header keyword found)`);
+                        }
+                        continue; // Skip this line - it's a header, not a transaction
+                    }
+                    
+                    // Look for amounts in current line and next few lines (multiline format)
+                    let combinedText = line;
+                    let lookAhead = i + 1;
+                    
+                    // Collect next 2-5 lines until we find amounts
+                    while (lookAhead < Math.min(i + 6, lines.length)) {
+                        const nextLine = lines[lookAhead].trim();
+                        // Stop if we hit another date or page footer
+                        if (nextLine.match(auDatePattern) || nextLine.includes('Page') || nextLine.includes('Reg. ofce')) {
+                            break;
+                        }
+                        combinedText += ' ' + nextLine;
+                        lookAhead++;
+                    }
+                    
+                    // Extract amounts from combined text - but filter out reference numbers
+                    // Reference numbers are typically long (6+ digits) while transaction amounts are reasonable (under 10 crore)
+                    const allAmountMatches = [...combinedText.matchAll(/[\d,]+\.\d{2}/g)];
+                    const validAmounts = [];
+                    
+                    for (const match of allAmountMatches) {
+                        const num = parseFloat(match[0].replace(/,/g, ''));
+                        // Filter: amounts should be between 0 and 100 crore (reasonable transaction range)
+                        // and not be part of reference numbers (which are usually standalone long numbers)
+                        if (num > 0 && num < 1000000000) {
+                            validAmounts.push(num);
+                        }
+                    }
+                    
+                    // We need at least 2 amounts: one for transaction + balance
+                    if (validAmounts.length >= 2) {
+                        // DEBUG: Log AU Bank parsing details
+                        if (transactions.length < 3) {
+                            console.log(`[AU_DEBUG] Date: ${dateMatch[0]}`);
+                            console.log(`[AU_DEBUG] Combined text: ${combinedText.substring(0, 100)}...`);
+                            console.log(`[AU_DEBUG] Valid amounts: ${validAmounts.join(', ')}`);
+                        }
+                        // Description is everything between date and first valid amount
+                        const afterDate = combinedText.substring(combinedText.indexOf(dateMatch[0]) + dateMatch[0].length);
+                        let description = afterDate.replace(/[\d,]+\.\d{2}/g, ' ').replace(/\s+/g, ' ').trim();
+                        description = description.substring(0, 80) || 'Transaction';
+                        
+                        // Determine debit/credit based on CR/DR indicators
+                        let debit = 0, credit = 0, balance = validAmounts[validAmounts.length - 1];
+                        
+                        if (validAmounts.length >= 3) {
+                            // Format: debit, credit, balance (3 amounts)
+                            // Check if first amount could be debit
+                            if (combinedText.includes('DR') || combinedText.includes('debit') || combinedText.includes('Debit')) {
+                                debit = validAmounts[validAmounts.length - 3];
+                                credit = validAmounts[validAmounts.length - 2];
+                            } else if (combinedText.includes('CR') || combinedText.includes('credit') || combinedText.includes('Credit')) {
+                                credit = validAmounts[validAmounts.length - 3];
+                                debit = validAmounts[validAmounts.length - 2];
+                            } else {
+                                // No indicator - assume standard bank format: debit, credit, balance
+                                debit = validAmounts[validAmounts.length - 3];
+                                credit = validAmounts[validAmounts.length - 2];
+                            }
+                        } else if (validAmounts.length === 2) {
+                            // Format: amount, balance - check for CR/DR indicators
+                            const amount = validAmounts[0];
+                            if (combinedText.includes('CR') || combinedText.includes('credit') || combinedText.includes('Credit')) {
+                                credit = amount;
+                            } else if (combinedText.includes('DR') || combinedText.includes('debit') || combinedText.includes('Debit')) {
+                                debit = amount;
+                            } else if (amount < 0) {
+                                debit = Math.abs(amount);
+                            } else {
+                                // Default: check if balance increased or decreased
+                                // If we have opening balance, we can determine
+                                credit = amount;
+                            }
+                        }
+                        
+                        // Skip if both debit and credit are 0 (invalid transaction)
+                        if (debit === 0 && credit === 0) {
+                            continue;
+                        }
+                        
+                        // Validate: balance should equal (prev_balance + credit - debit)
+                        // This ensures we're extracting correct amounts
+                        let prevBalance = transactions.length > 0 ? transactions[transactions.length - 1].balance : openingBalance;
+                        if (prevBalance === null || prevBalance === undefined || prevBalance === 0) {
+                            prevBalance = balance - credit + debit; // Calculate expected opening
+                        }
+                        
+                        const expectedBalance = parseFloat(prevBalance) + credit - debit;
+                        const balanceDiff = Math.abs(parseFloat(balance) - expectedBalance);
+                        
+                        // If balance doesn't match within 1 rupee tolerance, amounts might be wrong
+                        if (balanceDiff > 1 && transactions.length > 0) {
+                            // Try swapping debit and credit
+                            const expectedBalanceSwapped = parseFloat(prevBalance) + debit - credit;
+                            const balanceDiffSwapped = Math.abs(parseFloat(balance) - expectedBalanceSwapped);
+                            
+                            if (balanceDiffSwapped < balanceDiff) {
+                                // Swap was better, use swapped values
+                                const temp = debit;
+                                debit = credit;
+                                credit = temp;
+                            }
+                        }
+                        
+                        // DEBUG: Log final extracted transaction
+                        if (transactions.length < 3) {
+                            console.log(`[AU_DEBUG] -> Extracted transaction: Date=${dateMatch[0]}, Debit=${debit}, Credit=${credit}, Balance=${balance}`);
+                        }
+                        
+                        transactions.push({
+                            id: Math.random().toString(36).substr(2, 9),
+                            date: dateMatch[0],
+                            valueDate: dateMatch[0],
+                            description: description,
+                            reference: '',
+                            debit: debit,
+                            credit: credit,
+                            balance: balance
+                        });
+                        
+                        // Skip the lines we've processed
+                        i = lookAhead - 1;
+                    } else if (transactions.length < 5) {
+                        // DEBUG: Log why transaction was skipped
+                        console.log(`[AU_TRACE]   -> SKIPPED (only ${validAmounts.length} valid amounts found)`);
+                    }
+                }
+            }
+            
+            console.log(`[uploadStatement] After AU Bank parsing: ${transactions.length} transactions`);
         }
 
         // --- FALLBACKS ---
@@ -251,7 +648,10 @@ exports.uploadStatement = async (req, res) => {
             closingBalance = 0;
         }
 
-        await parser.destroy();
+        // pdf-parse v2.x doesn't have destroy method
+        if (parser && typeof parser.destroy === 'function') {
+            await parser.destroy();
+        }
 
         res.status(200).json({
             success: true,
@@ -259,7 +659,8 @@ exports.uploadStatement = async (req, res) => {
             file: {
                 filename: req.file.filename,
                 originalName: req.file.originalname,
-                fileUrl: `https://statsedit-api.onrender.com/uploads/${req.file.filename}`
+                fileUrl: `/uploads/${req.file.filename}`,
+                password: password || null  // Pass password to frontend for PDF.js
             },
             transactions: transactions,
             openingBalance,
@@ -423,7 +824,7 @@ exports.regeneratePdf = async (req, res) => {
         res.status(200).json({
             success: true,
             message: 'All values aligned and replaced.',
-            fileUrl: `https://statsedit-api.onrender.com/downloads/${fileName}`
+            fileUrl: `/downloads/${fileName}`
         });
 
     } catch (err) {
@@ -484,10 +885,13 @@ exports.downloadFile = (req, res) => {
     if (!fileUrl) return res.status(400).json({ success: false, message: 'fileUrl is required.' });
 
     try {
-        const urlPath = new URL(fileUrl).pathname; // e.g. /uploads/file.pdf or /downloads/file.pdf
+        // fileUrl is already a path like /downloads/file.pdf or /uploads/file.pdf
+        const urlPath = fileUrl;
         const fileName = path.basename(urlPath);
         const folder = urlPath.includes('/downloads/') ? 'downloads' : 'uploads';
         const filePath = path.join(__dirname, '..', folder, fileName);
+        console.log('[DOWNLOAD] fileUrl:', fileUrl);
+        console.log('[DOWNLOAD] resolved path:', filePath);
 
         if (!fs.existsSync(filePath)) {
             return res.status(404).json({ success: false, message: 'File not found.' });
@@ -517,7 +921,20 @@ exports.editDirect = async (req, res) => {
 
     try {
         // Parse the filename from the URL
-        const urlPath = new URL(fileUrl).pathname; // e.g. /uploads/filename.pdf or /downloads/filename.pdf
+        // Handle both relative URLs (/uploads/file.pdf) and absolute URLs (http://...)
+        let urlPath;
+        try {
+            if (fileUrl.startsWith('http://') || fileUrl.startsWith('https://')) {
+                urlPath = new URL(fileUrl).pathname;
+            } else {
+                // Relative URL - use it directly
+                urlPath = fileUrl;
+            }
+        } catch (urlError) {
+            // If URL parsing fails, treat as relative path
+            urlPath = fileUrl;
+        }
+        
         const segments = urlPath.split('/');
         const originalFilename = segments[segments.length - 1];
         const isDownload = urlPath.includes('/downloads/');
@@ -632,12 +1049,14 @@ exports.editDirect = async (req, res) => {
             const maskY = change.y - 4;
             const maskH = fontSize + 8;
 
+            const maskColorRGB = change.maskColor ? rgb(change.maskColor[0], change.maskColor[1], change.maskColor[2]) : rgb(1, 1, 1);
+
             page.drawRectangle({
                 x: maskX,
                 y: maskY,
                 width: maskWidth,
                 height: maskH,
-                color: rgb(1, 1, 1),
+                color: maskColorRGB,
             });
 
             // Use the exact text color extracted by pdf.js on the frontend
@@ -667,7 +1086,7 @@ exports.editDirect = async (req, res) => {
         res.status(200).json({
             success: true,
             message: 'Text edits applied successfully.',
-            fileUrl: `https://statsedit-api.onrender.com/downloads/${fileName}`
+            fileUrl: `/downloads/${fileName}`
         });
 
     } catch (err) {
