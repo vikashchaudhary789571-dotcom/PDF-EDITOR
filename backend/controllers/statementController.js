@@ -340,6 +340,11 @@ exports.uploadStatement = async (req, res) => {
             console.log(`[uploadStatement] PDFParse getText successful, text length: ${text.length}`);
             console.log(`[uploadStatement] Text sample (first 500 chars): ${text.substring(0, 500)}`);
             console.log(`[uploadStatement] Text sample (last 500 chars): ${text.substring(text.length - 500)}`);
+            
+            // CRITICAL DEBUG: Log all extracted amounts before filtering
+            const allAmountsInText = [...text.matchAll(/[\d,]+\.\d{2}/g)].map(m => m[0]);
+            console.log(`[CRITICAL_DEBUG] All amounts in raw text (${allAmountsInText.length} found):`);
+            console.log(allAmountsInText.slice(0, 20).join(', '));
         } catch (parseErr) {
             console.error('[uploadStatement] PDFParse error:', parseErr);
             const errMsg = parseErr.message || '';
@@ -932,6 +937,13 @@ exports.uploadStatement = async (req, res) => {
         // pdf-parse v2.x doesn't have destroy method
         if (parser && typeof parser.destroy === 'function') {
             await parser.destroy();
+        }
+
+        // CRITICAL DEBUG: Log final extracted data before sending
+        console.log(`[CRITICAL_DEBUG] FINAL RESULT: ${transactions.length} transactions`);
+        console.log(`[CRITICAL_DEBUG] Opening: ${openingBalance}, Closing: ${closingBalance}`);
+        if (transactions.length > 0) {
+            console.log(`[CRITICAL_DEBUG] First 3 transactions:`, transactions.slice(0, 3));
         }
 
         res.status(200).json({
