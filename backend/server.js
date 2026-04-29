@@ -92,34 +92,9 @@ const authRoutes = require('./routes/authRoutes');
 const statementRoutes = require('./routes/statementRoutes');
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5002;
 
-/* =========================
-   CORS CONFIG (STRICT + SAFE)
-========================= */
-const allowedOrigins = [
-    "https://editbank.onrender.com", // production frontend
-    "http://localhost:5173",          // local Vite dev server
-    "http://localhost:3000",          // fallback local dev
-];
-
-const corsOptions = {
-    origin: (origin, callback) => {
-        // Allow requests with no origin (e.g. mobile apps, curl, Postman)
-        if (!origin || allowedOrigins.includes(origin)) {
-            callback(null, true);
-        } else {
-            callback(new Error(`CORS policy: Origin ${origin} not allowed`));
-        }
-    },
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-    credentials: true,
-};
-
-app.use(cors(corsOptions));
-app.options("/{*splat}", cors(corsOptions)); // Handle preflight requests for all routes (Express 5 syntax)
-
+app.use(cors());
 
 /* =========================
    MIDDLEWARE
@@ -202,7 +177,7 @@ app.use((err, req, res, next) => {
    START SERVER
 ========================= */
 const server = app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
+    console.log("Server running on port", PORT);
 });
 
 // Increase timeouts for large file uploads (5 minutes)
