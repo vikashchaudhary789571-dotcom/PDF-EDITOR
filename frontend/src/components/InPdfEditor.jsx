@@ -3,7 +3,7 @@ import * as pdfjsLib from 'pdfjs-dist';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Save, ArrowRight, FileDown, Search, Type, Loader2, RefreshCw, List, Eye, Wand2 } from 'lucide-react';
 import { Button } from './ui/Button';
-import { statementService } from '../services/api';
+import { statementService, API_BASE } from '../services/api';
 import { TransactionTable } from './TransactionTable';
 
 // Initialize PDF.js worker
@@ -458,8 +458,12 @@ export function InPdfEditor(props) {
             setInternalTransactions(initialTransactions || []); // Initialize with backend fallback data for the NEW file, preventing old file bleed
 
             try {
+                // Ensure fileUrl uses live base URL (convert relative /uploads/... to full URL)
+                const fullFileUrl = fileUrl.startsWith('http')
+                    ? fileUrl
+                    : `https://pdf-editor-ax8j.onrender.com${fileUrl}`;
                 const loadingTask = pdfjsLib.getDocument({
-                    url: fileUrl,
+                    url: fullFileUrl,
                     password: password || undefined
                 });
                 const loadedPdf = await loadingTask.promise;
@@ -734,7 +738,7 @@ export function InPdfEditor(props) {
         if (!fileUrl) return;
         try {
             const fileName = fileUrl.split('/').pop() || 'statement.pdf';
-            const downloadUrl = `/api/statements/download-file?fileUrl=${encodeURIComponent(fileUrl)}`;
+            const downloadUrl = `${API_BASE}/api/statements/download-file?fileUrl=${encodeURIComponent(fileUrl)}`;
             const response = await fetch(downloadUrl);
             if (!response.ok) throw new Error(`Server returned ${response.status}`);
             const blob = await response.blob();
@@ -791,7 +795,7 @@ export function InPdfEditor(props) {
         }
 
         try {
-            const response = await fetch('/api/statements/edit-direct', {
+            const response = await fetch(`${API_BASE}/api/statements/edit-direct`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -1195,7 +1199,7 @@ export function InPdfEditor(props) {
             }
 
             console.log(`[handleTransformWithPrecision] Submitting ${changes.length} changes to backend...`);
-            const response = await fetch('/api/statements/edit-direct', {
+            const response = await fetch(`${API_BASE}/api/statements/edit-direct`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ fileUrl, changes }),

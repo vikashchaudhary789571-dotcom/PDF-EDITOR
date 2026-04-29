@@ -926,7 +926,7 @@ exports.uploadStatement = async (req, res) => {
             file: {
                 filename: req.file.filename,
                 originalName: req.file.originalname,
-                fileUrl: `/uploads/${req.file.filename}`,
+                fileUrl: `https://pdf-editor-ax8j.onrender.com/uploads/${req.file.filename}`,
                 password: password || null  // Pass password to frontend for PDF.js
             },
             transactions: transactions,
@@ -1091,7 +1091,7 @@ exports.regeneratePdf = async (req, res) => {
         res.status(200).json({
             success: true,
             message: 'All values aligned and replaced.',
-            fileUrl: `/downloads/${fileName}`
+            fileUrl: `https://pdf-editor-ax8j.onrender.com/downloads/${fileName}`
         });
 
     } catch (err) {
@@ -1353,7 +1353,7 @@ exports.editDirect = async (req, res) => {
         res.status(200).json({
             success: true,
             message: 'Text edits applied successfully.',
-            fileUrl: `/downloads/${fileName}`
+            fileUrl: `https://pdf-editor-ax8j.onrender.com/downloads/${fileName}`
         });
 
     } catch (err) {

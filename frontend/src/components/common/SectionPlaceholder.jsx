@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { statementService } from '../../services/api';
+import { statementService, API_BASE } from '../../services/api';
 import { Download, Trash2, FileCheck2, AlertCircle, FolderOpen, Search, FileDown } from 'lucide-react';
 import { Button } from '../ui/Button';
 
@@ -50,7 +50,7 @@ export function SectionPlaceholder({ title, description, icon }) {
     const handleDownload = async (item) => {
         setDownloading(item.id);
         try {
-            const downloadUrl = `/api/statements/download-file?fileUrl=${encodeURIComponent(item.fileUrl)}`;
+            const downloadUrl = `${API_BASE}/api/statements/download-file?fileUrl=${encodeURIComponent(item.fileUrl)}`;
             const res = await fetch(downloadUrl);
             if (!res.ok) throw new Error(`Server returned ${res.status}`);
             const blob = await res.blob();
