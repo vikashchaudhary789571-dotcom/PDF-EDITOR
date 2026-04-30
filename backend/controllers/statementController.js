@@ -635,8 +635,12 @@ exports.editDirect = async (req, res) => {
 
         let pdfBytes = fs.readFileSync(originalPath);
         if (password) {
-            const pdfDoc = await PDFDocument.load(pdfBytes, { password, ignoreEncryption: false });
-            pdfBytes = await pdfDoc.save();
+            try {
+                const pdfDoc = await PDFDocument.load(pdfBytes, { password, ignoreEncryption: false });
+                pdfBytes = await pdfDoc.save();
+            } catch (e) {
+                console.warn('[editDirect] Decryption failed, trying without password');
+            }
         }
 
         const pdfDoc = await PDFDocument.load(pdfBytes);
@@ -644,45 +648,78 @@ exports.editDirect = async (req, res) => {
         const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
         const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
 
-        changes.forEach(change => {
-            const page = pages[change.pageIndex - 1];
-            if (!page) return;
+        // Map to keep track of colors per page to avoid redundant extraction
+        const resolvedPageColors = pageColors || {};
 
+        for (const change of changes) {
+            const pageIndex = change.pageIndex;
+            const page = pages[pageIndex - 1];
+            if (!page) continue;
+
+            // 1. Determine Text Color (to match original look)
+            let textColor = rgb(0, 0, 0); // Default black
+            if (resolvedPageColors[pageIndex]) {
+                const c = resolvedPageColors[pageIndex];
+                textColor = rgb(c.r, c.g, c.b);
+            } else {
+                // Try to extract it if not provided
+                const extracted = extractPageTextColor(pdfDoc, page);
+                if (extracted) {
+                    resolvedPageColors[pageIndex] = extracted;
+                    textColor = rgb(extracted.r, extracted.g, extracted.b);
+                }
+            }
+
+            // 2. Formatting & Alignment
             const fontSize = Math.max(change.fontSize || 8, 5);
             const currentFont = change.isBold ? boldFont : font;
             const textWidth = currentFont.widthOfTextAtSize(String(change.newText), fontSize);
             
             let drawX = change.x;
             if (change.isNumeric && change.width) {
+                // Right-align within the original item's footprint
                 drawX = change.x + change.width - textWidth;
+                
+                // Safety: ensure it doesn't cross the left boundary if minDrawX was provided (for summaries)
+                if (change.minDrawX && drawX < change.minDrawX) {
+                    drawX = change.minDrawX;
+                }
             }
 
+            // 3. Masking
+            // Use provided maskColor (summary items) or default to white
             const mColor = change.maskColor && Array.isArray(change.maskColor) 
                 ? rgb(change.maskColor[0], change.maskColor[1], change.maskColor[2])
                 : rgb(1, 1, 1);
 
-            // MASKING: Use the larger of original width or new text width to ensure full erasure
+            // Calculate mask footprint
             const maskWidth = Math.max(change.width || 0, textWidth) + 4;
-            const maskX = change.isNumeric && change.width ? (change.x + change.width - maskWidth + 2) : (drawX - 2);
+            const maskX = change.isNumeric && change.width 
+                ? (change.x + change.width - maskWidth + 2) 
+                : (drawX - 2);
 
+            // Draw mask (covers old text)
             page.drawRectangle({
                 x: maskX, y: change.y - 4, width: maskWidth, height: fontSize + 8,
                 color: mColor
             });
 
+            // Draw new text (uses detected page text color)
             page.drawText(String(change.newText), {
                 x: drawX, y: change.y, size: fontSize, font: currentFont,
-                color: rgb(0, 0, 0)
+                color: textColor
             });
-        });
+        }
 
         const finalBytes = await pdfDoc.save();
         const outName = `transformed_${Date.now()}_${fileName}`;
         const outPath = path.join(__dirname, '../downloads', outName);
+        if (!fs.existsSync(path.join(__dirname, '../downloads'))) fs.mkdirSync(path.join(__dirname, '../downloads'));
         fs.writeFileSync(outPath, finalBytes);
 
         res.status(200).json({ success: true, fileUrl: `/downloads/${outName}` });
     } catch (err) {
+        console.error('[editDirect] Error:', err);
         res.status(500).json({ success: false, message: err.message });
     }
 };

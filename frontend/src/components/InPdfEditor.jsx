@@ -668,12 +668,12 @@ export function InPdfEditor(props) {
 
             const rows = [];
             let currentRow = [];
-            let lastY = -1;
+            let rowAnchorY = -9999;
             allItems.forEach(item => {
-                if (Math.abs(item.y - lastY) > 5) {
+                if (Math.abs(item.y - rowAnchorY) > 15) {
                     if (currentRow.length > 0) rows.push(currentRow);
                     currentRow = [item];
-                    lastY = item.y;
+                    rowAnchorY = item.y;
                 } else {
                     currentRow.push(item);
                 }
@@ -887,21 +887,24 @@ export function InPdfEditor(props) {
             // Sort page-first (ascending), then top-to-bottom within each page (descending Y)
             allItems.sort((a, b) => a.pageIdx === b.pageIdx ? b.y - a.y : a.pageIdx - b.pageIdx);
 
-            // Group items into rows — reset row whenever the page changes OR Y jumps > 8 pts
+            // Group into rows, ensuring we break rows on page changes
             const rows = [];
             let currentRow = [];
-            let lastY = -1;
             let lastPageIdx = -1;
+            let rowAnchorY = -9999;
+
             allItems.forEach(item => {
-                const pageChanged = item.pageIdx !== lastPageIdx && lastPageIdx !== -1;
-                if (pageChanged || Math.abs(item.y - lastY) > 8) {
+                const isNewPage = item.pageIdx !== lastPageIdx;
+                // Use 15pt tolerance, anchored to the first item of the row (consistent with runAutoCalculation)
+                const isNewY = Math.abs(item.y - rowAnchorY) > 15;
+
+                if (isNewPage || isNewY) {
                     if (currentRow.length > 0) rows.push(currentRow);
                     currentRow = [item];
-                    lastY = item.y;
+                    rowAnchorY = item.y; 
                     lastPageIdx = item.pageIdx;
                 } else {
                     currentRow.push(item);
-                    lastPageIdx = item.pageIdx;
                 }
             });
             if (currentRow.length > 0) rows.push(currentRow);
@@ -963,13 +966,35 @@ export function InPdfEditor(props) {
             };
 
             txnRows.forEach((row, idx) => {
+                // Horizontally merge items that are very close to each other to fix pdf.js number splitting
+                const sortedX = [...row].sort((a, b) => a.x - b.x);
+                const mergedItems = [];
+                let curMerged = null;
+                
+                sortedX.forEach(it => {
+                    if (!curMerged) {
+                        curMerged = { ...it };
+                    } else {
+                        const curEnd = curMerged.x + (curMerged.width || 0);
+                        const gap = it.x - curEnd;
+                        // 3.5pt gap covers kerning/sub-space splits common in numeric columns
+                        if (gap < 3.5) { 
+                            curMerged.text += '' + (it.text || '');
+                            curMerged.width = (it.x + (it.width || 0)) - curMerged.x;
+                        } else {
+                            mergedItems.push(curMerged);
+                            curMerged = { ...it };
+                        }
+                    }
+                });
+                if (curMerged) mergedItems.push(curMerged);
+
                 // BOUNDED COLUMN ASSIGNMENT: Virtual "Walls" between columns
-                const rowItems = row.filter(it => {
+                const rowItems = mergedItems.filter(it => {
                     const txt = it.text.trim();
                     // Must be numeric pattern
                     if (!/^[0-9,.\-\s()₹]+$/.test(txt) && txt !== '-') return false;
                     // Anti-Reference Check: Amounts in AU Bank are almost never > 10 digits
-                    // If it's longer, it's likely a Cheque/Reference No. or Account Number
                     const clean = txt.replace(/[^0-9]/g, '');
                     if (clean.length > 10) return false;
                     return true;
@@ -986,6 +1011,7 @@ export function InPdfEditor(props) {
                     else targetKey = 'balance';
 
                     const existing = columnAssignments[targetKey];
+                    // Prefer non-empty values over placeholders
                     if (!existing || (it.text !== '-' && existing.text === '-')) {
                         columnAssignments[targetKey] = it;
                     }
@@ -1218,10 +1244,19 @@ export function InPdfEditor(props) {
             }
 
             console.log(`[handleTransformWithPrecision] Submitting ${changes.length} changes to backend...`);
+            
+            // Collect per-page text colors to send to backend
+            const pageColors = {};
+            pagesData.forEach(page => {
+                if (page.textColor) {
+                    pageColors[page.pageIndex] = page.textColor;
+                }
+            });
+
             const response = await fetch(`${API_BASE}/api/statements/edit-direct`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ fileUrl, changes }),
+                body: JSON.stringify({ fileUrl, changes, pageColors }),
             });
 
             if (response.ok) {
