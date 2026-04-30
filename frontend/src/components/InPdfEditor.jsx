@@ -37,10 +37,11 @@ export function InPdfEditor(props) {
 
     const analyzeTableStructure = (allPagesData) => {
         const dateSigs = ['date', 'value dt', 'vldt', 'tran date', 'value date'];
-        const debitSigs = ['debit', 'withdrawal', 'payment', 'paid out', 'dr(', 'dr (', 'dr (₹)'];
-        const creditSigs = ['credit', 'deposit', 'receipt', 'paid in', 'cr(', 'cr (', 'cr (₹)'];
-        const balanceSigs = ['balance', 'bal (', 'bal(₹)'];
+        const debitSigs = ['debit', 'withdrawal', 'payment', 'paid out', 'dr(', 'dr (', 'dr (₹)', 'dr', 'debit(₹)'];
+        const creditSigs = ['credit', 'deposit', 'receipt', 'paid in', 'cr(', 'cr (', 'cr (₹)', 'cr', 'credit(₹)'];
+        const balanceSigs = ['balance', 'bal (', 'bal(₹)', 'bal', 'balance(₹)'];
 
+        // Strategy 1: Look for header row with multiple column signatures
         for (const page of allPagesData) {
             const items = page.items;
             const rows = [];
@@ -69,6 +70,7 @@ export function InPdfEditor(props) {
                 const mCredit = findMatch(creditSigs);
                 const mBalance = findMatch(balanceSigs);
 
+                // Require at least date + one of (debit, credit, balance)
                 if (mDate && (mDebit || mCredit || mBalance)) {
                     const getX = (it) => it ? it.x + it.width / 2 : null;
 
@@ -80,23 +82,56 @@ export function InPdfEditor(props) {
                         balanceX: getX(mBalance)
                     };
 
-                    // FALLBACKS: If a column isn't found, try to find it relative to others using standard spacing
+                    // FALLBACKS: If a column isn't found, estimate based on others
                     if (structure.debitX === null && structure.creditX !== null) structure.debitX = structure.creditX - 100;
                     if (structure.creditX === null && structure.debitX !== null) structure.creditX = structure.debitX + 100;
                     if (structure.balanceX === null && structure.creditX !== null) structure.balanceX = structure.creditX + 100;
 
-                    // DEFINE BOUNDARIES: Midpoints between header centers
+                    // DEFINE BOUNDARIES
                     structure.boundaries = {
-                        debitLeft: (structure.debitX || 400) - 50, // Default left of debit
-                        debitCredit: (structure.debitX + structure.creditX) / 2,
-                        creditBalance: (structure.creditX + structure.balanceX) / 2
+                        debitLeft: (structure.debitX || 400) - 50,
+                        debitCredit: structure.debitX && structure.creditX ? (structure.debitX + structure.creditX) / 2 : 400,
+                        creditBalance: structure.creditX && structure.balanceX ? (structure.creditX + structure.balanceX) / 2 : 500
                     };
 
-                    console.log("[analyzeTableStructure] Final Bounded Structure:", structure);
+                    console.log("[analyzeTableStructure] Header found on page", page.pageIndex, structure);
                     setTableStructure(structure);
                     return;
                 }
             }
+        }
+
+        // Strategy 2: If header not found, create a default structure based on page content
+        console.warn("[analyzeTableStructure] Header not detected, using default structure");
+        
+        // Analyze all items to estimate column positions
+        const allItems = [];
+        allPagesData.forEach(p => {
+            p.items.forEach(item => {
+                allItems.push({ ...item, pageIdx: p.pageIndex });
+            });
+        });
+
+        if (allItems.length > 0) {
+            // Sort by X position to identify columns
+            const xPositions = [...new Set(allItems.map(it => Math.round(it.x / 10) * 10))].sort((a, b) => a - b);
+            
+            const defaultStructure = {
+                pageIndex: allPagesData[0]?.pageIndex || 0,
+                headerY: allPagesData[0]?.items[0]?.y || 700,
+                debitX: xPositions[Math.floor(xPositions.length * 0.6)] || 400,
+                creditX: xPositions[Math.floor(xPositions.length * 0.7)] || 480,
+                balanceX: xPositions[Math.floor(xPositions.length * 0.8)] || 550,
+            };
+
+            defaultStructure.boundaries = {
+                debitLeft: (defaultStructure.debitX || 400) - 50,
+                debitCredit: ((defaultStructure.debitX || 400) + (defaultStructure.creditX || 480)) / 2,
+                creditBalance: ((defaultStructure.creditX || 480) + (defaultStructure.balanceX || 550)) / 2
+            };
+
+            console.log("[analyzeTableStructure] Using default fallback structure:", defaultStructure);
+            setTableStructure(defaultStructure);
         }
     };
 
@@ -657,10 +692,48 @@ export function InPdfEditor(props) {
         setIsTransforming(true);
         setViewMode('pdf');
         try {
-            if (!tableStructure) {
-                alert("Table structure not detected. Please ensure the PDF contains Debit/Credit/Balance headers.");
-                setIsTransforming(false);
-                return;
+            let structureToUse = tableStructure;
+            
+            if (!structureToUse) {
+                // If no structure, try to create one on the fly from current pagesData
+                console.log("Table structure missing in transform, analyzing pagesData...");
+                
+                if (!pagesData || pagesData.length === 0) {
+                    alert("No PDF data available. Please reload the PDF and try again.");
+                    setIsTransforming(false);
+                    return;
+                }
+                
+                // Create a minimal structure from pagesData
+                const allItems = [];
+                pagesData.forEach(p => {
+                    p.items.forEach(item => {
+                        allItems.push({ ...item, pageIdx: p.pageIndex });
+                    });
+                });
+                
+                if (allItems.length === 0) {
+                    alert("Cannot extract table structure from PDF. Format may not be supported.");
+                    setIsTransforming(false);
+                    return;
+                }
+                
+                const xPositions = [...new Set(allItems.map(it => Math.round(it.x / 10) * 10))].sort((a, b) => a - b);
+                
+                structureToUse = {
+                    pageIndex: pagesData[0]?.pageIndex || 0,
+                    headerY: pagesData[0]?.items[0]?.y || 700,
+                    debitX: xPositions[Math.floor(xPositions.length * 0.6)] || 400,
+                    creditX: xPositions[Math.floor(xPositions.length * 0.7)] || 480,
+                    balanceX: xPositions[Math.floor(xPositions.length * 0.8)] || 550,
+                    boundaries: {
+                        debitLeft: 350,
+                        debitCredit: 440,
+                        creditBalance: 530
+                    }
+                };
+                
+                console.log("Created fallback structure:", structureToUse);
             }
 
             const changes = [];
@@ -709,8 +782,8 @@ export function InPdfEditor(props) {
             const txnRows = rows.filter(row => {
                 const firstItem = row[0];
                 if (!firstItem) return false;
-                const isAfterHeaderPage = firstItem.pageIdx > tableStructure.pageIndex;
-                const isOnHeaderPageBelowHeader = firstItem.pageIdx === tableStructure.pageIndex && firstItem.y < tableStructure.headerY - 10;
+                const isAfterHeaderPage = firstItem.pageIdx > structureToUse.pageIndex;
+                const isOnHeaderPageBelowHeader = firstItem.pageIdx === structureToUse.pageIndex && firstItem.y < structureToUse.headerY - 10;
                 if (!isAfterHeaderPage && !isOnHeaderPageBelowHeader) return false;
 
                 const rowText = row.map(it => (it.text || '').toLowerCase()).join(' ');
@@ -720,7 +793,7 @@ export function InPdfEditor(props) {
 
                 if (!txnDateRegex.test(rowText)) return false;
 
-                return row.some(it => Math.abs(it.x - tableStructure.balanceX) < 45);
+                return row.some(it => Math.abs(it.x - structureToUse.balanceX) < 45);
             });
 
             // 3. Pass: Map table data to these rows using VALUE-BASED MATCHING.
@@ -763,11 +836,11 @@ export function InPdfEditor(props) {
 
                 rowItems.forEach(it => {
                     const mid = it.x + (it.width || 0) / 2;
-                    if (mid < tableStructure.boundaries.debitLeft) return;
+                    if (mid < structureToUse.boundaries.debitLeft) return;
 
                     let targetKey = null;
-                    if (mid < tableStructure.boundaries.debitCredit) targetKey = 'debit';
-                    else if (mid < tableStructure.boundaries.creditBalance) targetKey = 'credit';
+                    if (mid < structureToUse.boundaries.debitCredit) targetKey = 'debit';
+                    else if (mid < structureToUse.boundaries.creditBalance) targetKey = 'credit';
                     else targetKey = 'balance';
 
                     const existing = columnAssignments[targetKey];
@@ -833,9 +906,9 @@ export function InPdfEditor(props) {
                         let targetVal = null;
 
                         // Identify if this item belongs to the Debit or Credit total column
-                        if (mid > tableStructure.boundaries.debitLeft && mid < tableStructure.boundaries.debitCredit) {
+                        if (mid > structureToUse.boundaries.debitLeft && mid < structureToUse.boundaries.debitCredit) {
                             targetVal = totalDebit;
-                        } else if (mid >= tableStructure.boundaries.debitCredit && mid < tableStructure.boundaries.creditBalance) {
+                        } else if (mid >= structureToUse.boundaries.debitCredit && mid < structureToUse.boundaries.creditBalance) {
                             targetVal = totalCredit;
                         }
 
