@@ -263,10 +263,18 @@ export function InPdfEditor(props) {
             setIsLoading(true);
             try {
                 setPagesData([]);
-                const loadingTask = pdfjsLib.getDocument(pwd ? { url: fileUrl, password: pwd } : fileUrl);
+                
+                // Determine if this is a transformed PDF (from downloads) or original (from uploads)
+                // Transformed PDFs don't have password protection
+                const isTransformedPdf = fileUrl.includes('/downloads/');
+                const passwordToUse = isTransformedPdf ? null : pwd;
+                
+                const loadingTask = pdfjsLib.getDocument(
+                    passwordToUse ? { url: fileUrl, password: passwordToUse } : fileUrl
+                );
                 const loadedPdf = await loadingTask.promise;
                 
-                if (pwd) pdfPasswordRef.current = pwd;
+                if (pwd && !isTransformedPdf) pdfPasswordRef.current = pwd;
                 
                 setPdf(loadedPdf);
                 setNumPages(loadedPdf.numPages);
@@ -1004,7 +1012,23 @@ export function InPdfEditor(props) {
 
             if (response.ok) {
                 const data = await response.json();
+                // Update file URL to trigger reload
                 onUpdateFileUrl(data.fileUrl);
+                
+                // Clear pagesData to force PDF reload
+                setPagesData([]);
+                
+                // Reset internal transactions to reflect saved state
+                setInternalTransactions([]);
+                
+                // Increment fileVersion to force useEffect re-run
+                setFileVersion(v => v + 1);
+                
+                // Small delay to ensure backend file is written, then reload
+                setTimeout(() => {
+                    setIsLoading(true);
+                }, 100);
+                
                 // The viewMode is already set to 'pdf' at the start
             } else {
                 const err = await response.json();
