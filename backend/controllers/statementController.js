@@ -206,7 +206,7 @@ exports.uploadStatement = async (req, res) => {
             file: {
                 filename: req.file.filename,
                 originalName: req.file.originalname,
-                fileUrl: `https://pdf-editor-2.onrender.com/uploads/${req.file.filename}`
+                fileUrl: `http://localhost:5001/uploads/${req.file.filename}`
             },
             transactions: transactions,
             openingBalance,
@@ -235,9 +235,10 @@ exports.regeneratePdf = async (req, res) => {
 
         if (!fs.existsSync(originalPath)) throw new Error('Original file missing.');
 
-        // If password is provided, use it to decrypt; otherwise ignore encryption as fallback
-        const loadOptions = password ? { password: password } : { ignoreEncryption: true };
-        const pdfDoc = await PDFDocument.load(fs.readFileSync(originalPath), loadOptions);
+        // pdf-lib cannot decrypt AES-256 PDFs — always use ignoreEncryption
+        const pdfDoc = await PDFDocument.load(fs.readFileSync(originalPath), { ignoreEncryption: true });
+        // Strip encryption dictionary so the saved PDF is clean and can be re-loaded freely
+        if (pdfDoc.context.trailerInfo.Encrypt) delete pdfDoc.context.trailerInfo.Encrypt;
         const firstPage = pdfDoc.getPages()[0];
 
         const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
@@ -327,7 +328,7 @@ exports.regeneratePdf = async (req, res) => {
 
         res.status(200).json({
             success: true,
-            fileUrl: `https://pdf-editor-2.onrender.com/downloads/${fileName}`
+            fileUrl: `http://localhost:5001/downloads/${fileName}`
         });
     } catch (err) {
         console.error('Regeneration Error:', err);
@@ -371,6 +372,8 @@ exports.editDirect = async (req, res) => {
     if (!Array.isArray(changes) || changes.length === 0) return res.status(400).json({ success: false, message: 'No changes provided.' });
 
     try {
+        console.log(`[editDirect] ▶ Starting transformation with ${changes.length} changes. Password provided: ${!!password}`);
+        
         const urlPath = new URL(fileUrl).pathname;
         const segments = urlPath.split('/');
         const originalFilename = segments[segments.length - 1];
@@ -378,15 +381,49 @@ exports.editDirect = async (req, res) => {
         const baseDir = isDownload ? path.join(__dirname, '../downloads') : path.join(__dirname, '../uploads');
         const originalPath = path.join(baseDir, originalFilename);
 
-        if (!fs.existsSync(originalPath)) return res.status(404).json({ success: false, message: 'File not found' });
+        console.log(`[editDirect] Original filename: ${originalFilename}`);
+        console.log(`[editDirect] Is download: ${isDownload}`);
+        console.log(`[editDirect] Base dir: ${baseDir}`);
+        console.log(`[editDirect] Full path: ${originalPath}`);
 
-        // If password is provided, use it to decrypt; otherwise ignore encryption as fallback
-        const loadOptions = password ? { password: password } : { ignoreEncryption: true };
+        if (!fs.existsSync(originalPath)) {
+            console.error(`[editDirect] ✗ File not found at: ${originalPath}`);
+            return res.status(404).json({ success: false, message: 'File not found' });
+        }
+
+        console.log(`[editDirect] ✓ File exists at: ${originalPath}`);
+        console.log(`[editDirect] File size: ${fs.statSync(originalPath).size} bytes`);
         
-        const pdfDoc = await PDFDocument.load(fs.readFileSync(originalPath), loadOptions);
+        // pdf-lib cannot decrypt AES-256 PDFs — always use ignoreEncryption
+        let pdfDoc;
+        try {
+            pdfDoc = await PDFDocument.load(fs.readFileSync(originalPath), { 
+                ignoreEncryption: true,
+                updateMetadata: false
+            });
+            console.log(`[editDirect] ✓ PDF loaded successfully (${pdfDoc.getPageCount()} pages)`);
+        } catch (loadErr) {
+            console.error(`[editDirect] ✗ Failed to load PDF:`, loadErr.message);
+            throw new Error(`PDF loading failed: ${loadErr.message}`);
+        }
+        
+        // Strip encryption dictionary so the saved PDF is clean and can be re-loaded freely
+        if (pdfDoc.context.trailerInfo.Encrypt) {
+            delete pdfDoc.context.trailerInfo.Encrypt;
+            console.log(`[editDirect] ✓ Stripped encryption from PDF`);
+        }
+        
         const pages = pdfDoc.getPages();
-        const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-        const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+        let font, boldFont;
+        
+        try {
+            font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+            boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+            console.log(`[editDirect] ✓ Fonts embedded successfully`);
+        } catch (fontErr) {
+            console.error(`[editDirect] ✗ Font embedding failed:`, fontErr.message);
+            throw new Error(`Font embedding failed: ${fontErr.message}`);
+        }
 
         const pageTextColors = {};
         if (pageColors && typeof pageColors === 'object') {
@@ -403,71 +440,119 @@ exports.editDirect = async (req, res) => {
             }
         });
 
-        changes.forEach((change) => {
+        console.log(`[editDirect] ✓ Extracted text colors for ${Object.keys(pageTextColors).length} pages`);
+
+        let appliedChanges = 0;
+        changes.forEach((change, idx) => {
             const page = pages[change.pageIndex - 1];
-            if (!page) return;
-
-            const fontSize = Math.max(change.fontSize || 8, 5);
-            const textStr = String(change.newText);
-            const currentFont = change.isBold ? boldFont : font;
-            const textWidth = currentFont.widthOfTextAtSize(textStr, fontSize);
-            const cellWidth = change.width || textWidth;
-
-            let drawX = change.x;
-            if (change.isNumeric && change.width) {
-                drawX = (change.x + change.width) - textWidth;
-            }
-            if (change.isSummaryItem && change.minDrawX != null && drawX < change.minDrawX) {
-                drawX = change.minDrawX;
+            if (!page) {
+                console.warn(`[editDirect] ⚠ Page ${change.pageIndex} not found (out of ${pages.length} pages)`);
+                return;
             }
 
-            const isTable = change.isTableItem === true;
-            const hPaddingRight = isTable ? 2 : 6;
-            const hPaddingLeft = isTable ? 2 : 0;
-            const maskX = Math.min(change.x, drawX) - hPaddingLeft;
-            const maskWidth = Math.max(change.x + cellWidth, drawX + textWidth) - maskX + hPaddingRight;
+            try {
+                const fontSize = Math.max(change.fontSize || 8, 5);
+                const textStr = String(change.newText);
+                const currentFont = change.isBold ? boldFont : font;
+                const textWidth = currentFont.widthOfTextAtSize(textStr, fontSize);
+                const cellWidth = change.width || textWidth;
 
-            let maskColor = rgb(1, 1, 1);
-            if (change.maskColor && Array.isArray(change.maskColor)) {
-                maskColor = rgb(change.maskColor[0]/255, change.maskColor[1]/255, change.maskColor[2]/255);
+                let drawX = change.x;
+                if (change.isNumeric && change.width) {
+                    drawX = (change.x + change.width) - textWidth;
+                }
+                if (change.isSummaryItem && change.minDrawX != null && drawX < change.minDrawX) {
+                    drawX = change.minDrawX;
+                }
+
+                const isTable = change.isTableItem === true;
+                const hPaddingRight = isTable ? 2 : 6;
+                const hPaddingLeft = isTable ? 2 : 0;
+                const maskX = Math.min(change.x, drawX) - hPaddingLeft;
+                const maskWidth = Math.max(change.x + cellWidth, drawX + textWidth) - maskX + hPaddingRight;
+
+                let maskColor = rgb(1, 1, 1);
+                if (change.maskColor && Array.isArray(change.maskColor)) {
+                    maskColor = rgb(change.maskColor[0]/255, change.maskColor[1]/255, change.maskColor[2]/255);
+                }
+
+                page.drawRectangle({
+                    x: maskX,
+                    y: change.y - 4,
+                    width: maskWidth,
+                    height: fontSize + 8,
+                    color: maskColor,
+                });
+
+                const textColor = pageTextColors[change.pageIndex] || rgb(0, 0, 0);
+                page.drawText(textStr, {
+                    x: drawX,
+                    y: change.y,
+                    size: fontSize,
+                    font: currentFont,
+                    color: textColor,
+                });
+
+                appliedChanges++;
+            } catch (changeErr) {
+                console.warn(`[editDirect] ⚠ Failed to apply change ${idx}:`, changeErr.message);
             }
-
-            page.drawRectangle({
-                x: maskX,
-                y: change.y - 4,
-                width: maskWidth,
-                height: fontSize + 8,
-                color: maskColor,
-            });
-
-            const textColor = pageTextColors[change.pageIndex] || rgb(0, 0, 0);
-            page.drawText(textStr, {
-                x: drawX,
-                y: change.y,
-                size: fontSize,
-                font: currentFont,
-                color: textColor,
-            });
         });
 
-        const pdfBytes = await pdfDoc.save();
+        console.log(`[editDirect] ✓ Applied ${appliedChanges} out of ${changes.length} changes`);
+
+        let pdfBytes;
+        try {
+            pdfBytes = await pdfDoc.save({ 
+                useObjectStreams: false,
+                addDefaultPage: false
+            });
+            console.log(`[editDirect] ✓ PDF saved successfully (${pdfBytes.length} bytes)`);
+        } catch (saveErr) {
+            console.error(`[editDirect] ✗ PDF save failed:`, saveErr.message);
+            throw new Error(`PDF save failed: ${saveErr.message}`);
+        }
+
         const fileName = `transformed_${Date.now()}_${originalFilename}`;
         const filePath = path.join(__dirname, '../downloads', fileName);
         
-        if (!fs.existsSync(path.join(__dirname, '../downloads'))) {
-            fs.mkdirSync(path.join(__dirname, '../downloads'), { recursive: true });
+        const downloadsDir = path.join(__dirname, '../downloads');
+        if (!fs.existsSync(downloadsDir)) {
+            fs.mkdirSync(downloadsDir, { recursive: true });
+            console.log(`[editDirect] ✓ Created downloads directory`);
         }
         
-        fs.writeFileSync(filePath, pdfBytes);
-        console.log(`[editDirect] Saved transformed PDF: ${fileName}`);
+        try {
+            fs.writeFileSync(filePath, pdfBytes);
+            console.log(`[editDirect] ✓ File written to: ${filePath}`);
+            console.log(`[editDirect] ✓ File size: ${fs.statSync(filePath).size} bytes`);
+        } catch (writeErr) {
+            console.error(`[editDirect] ✗ File write failed:`, writeErr.message);
+            throw new Error(`File write failed: ${writeErr.message}`);
+        }
+
+        const responseUrl = `http://localhost:5001/downloads/${fileName}`;
+        console.log(`[editDirect] ✓ Transform complete! URL: ${responseUrl}`);
 
         res.status(200).json({
             success: true,
             message: 'Text edits applied successfully.',
-            fileUrl: `https://pdf-editor-2.onrender.com/downloads/${fileName}`
+            fileUrl: responseUrl,
+            stats: {
+                changesApplied: appliedChanges,
+                totalChanges: changes.length,
+                fileSize: pdfBytes.length
+            }
         });
     } catch (err) {
-        console.error('[editDirect] Error:', err);
-        res.status(500).json({ success: false, message: err.message });
+        console.error('[editDirect] ✗ TRANSFORMATION ERROR:', err.message);
+        console.error('[editDirect] Stack:', err.stack);
+        
+        let userMessage = err.message;
+        if (err.message.includes('encrypted') || err.message.includes('password')) {
+            userMessage = `PDF encryption error: ${err.message}. Try re-uploading with the correct password.`;
+        }
+        
+        res.status(500).json({ success: false, message: userMessage });
     }
 };

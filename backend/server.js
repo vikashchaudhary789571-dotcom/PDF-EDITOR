@@ -53,7 +53,9 @@ app.use('/downloads', express.static(downloadDir));
 
 // Start server with robust error handling
 const server = app.listen(port, () => {
-    console.log(`Backend server ACTIVE at https://pdf-editor-2.onrender.com (Port: ${port})`);
+    console.log(`Backend server ACTIVE at http://localhost:${port} (Port: ${port})`);
+    console.log(`Backend API: http://localhost:${port}/api`);
+    console.log(`File uploads available at: http://localhost:${port}/uploads`);
     console.log('Press Ctrl+C to stop the server.');
 });
 

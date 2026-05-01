@@ -18,6 +18,7 @@ export function InPdfEditor(props) {
     const [scale, setScale] = useState(1.5);
     const [isSaving, setIsSaving] = useState(false);
     const [isTransforming, setIsTransforming] = useState(false);
+    const [transformError, setTransformError] = useState(null);
     const containerRef = useRef(null);
     const [viewMode, setViewMode] = useState('pdf'); // 'pdf' or 'table'
     const { initialTransactions = [], initialBalances = { opening: 0, closing: 0 } } = props;
@@ -26,7 +27,7 @@ export function InPdfEditor(props) {
     const [tableStructure, setTableStructure] = useState(null);
     const [fileVersion, setFileVersion] = useState(0);
     const [internalTransactions, setInternalTransactions] = useState(initialTransactions);
-    const pdfPasswordRef = useRef(null);
+    const pdfPasswordRef = useRef(initialPassword || null);
 
     // Sync internalTransactions when initialTransactions prop changes
     useEffect(() => {
@@ -36,10 +37,12 @@ export function InPdfEditor(props) {
     }, [initialTransactions]);
 
     const analyzeTableStructure = (allPagesData) => {
-        const dateSigs = ['date', 'value dt', 'vldt', 'tran date', 'value date'];
-        const debitSigs = ['debit', 'withdrawal', 'payment', 'paid out', 'dr(', 'dr (', 'dr (₹)'];
-        const creditSigs = ['credit', 'deposit', 'receipt', 'paid in', 'cr(', 'cr (', 'cr (₹)'];
-        const balanceSigs = ['balance', 'bal (', 'bal(₹)'];
+        const dateSigs = ['date', 'value dt', 'vldt', 'tran date', 'value date', 'transaction date'];
+        const debitSigs = ['debit', 'withdrawal', 'payment', 'paid out', 'dr(', 'dr (', 'dr (₹)', 'withdrawn', 'debit amount'];
+        const creditSigs = ['credit', 'deposit', 'receipt', 'paid in', 'cr(', 'cr (', 'cr (₹)', 'deposited', 'credit amount'];
+        const balanceSigs = ['balance', 'bal (', 'bal(₹)', 'closing balance', 'running balance', 'account balance'];
+
+        let foundStructure = null;
 
         for (const page of allPagesData) {
             const items = page.items;
@@ -47,6 +50,7 @@ export function InPdfEditor(props) {
             let currentRow = [];
             let lastY = -1;
             const sorted = [...items].sort((a, b) => b.y - a.y);
+            
             sorted.forEach(it => {
                 if (Math.abs(it.y - lastY) > 5) {
                     if (currentRow.length > 0) rows.push(currentRow);
@@ -58,8 +62,13 @@ export function InPdfEditor(props) {
             });
             if (currentRow.length > 0) rows.push(currentRow);
 
+            console.log(`[analyzeTableStructure] Page ${page.pageIndex} has ${rows.length} rows`);
+
+            // STRATEGY 1: Find a row with date AND (debit OR credit OR balance) headers
             for (const row of rows) {
                 const textJoined = row.map(it => it.text.toLowerCase()).join(' ');
+                
+                // Skip metadata rows
                 if (textJoined.includes(':')) continue;
                 if (textJoined.includes('opening') || textJoined.includes('closing')) continue;
 
@@ -72,7 +81,7 @@ export function InPdfEditor(props) {
                 if (mDate && (mDebit || mCredit || mBalance)) {
                     const getX = (it) => it ? it.x + it.width / 2 : null;
 
-                    const structure = {
+                    foundStructure = {
                         pageIndex: page.pageIndex,
                         headerY: row[0].y,
                         debitX: getX(mDebit),
@@ -80,23 +89,86 @@ export function InPdfEditor(props) {
                         balanceX: getX(mBalance)
                     };
 
-                    // FALLBACKS: If a column isn't found, try to find it relative to others using standard spacing
-                    if (structure.debitX === null && structure.creditX !== null) structure.debitX = structure.creditX - 100;
-                    if (structure.creditX === null && structure.debitX !== null) structure.creditX = structure.debitX + 100;
-                    if (structure.balanceX === null && structure.creditX !== null) structure.balanceX = structure.creditX + 100;
+                    // FALLBACKS: If a column isn't found, try to find it relative to others
+                    if (foundStructure.debitX === null && foundStructure.creditX !== null) foundStructure.debitX = foundStructure.creditX - 100;
+                    if (foundStructure.creditX === null && foundStructure.debitX !== null) foundStructure.creditX = foundStructure.debitX + 100;
+                    if (foundStructure.balanceX === null && foundStructure.creditX !== null) foundStructure.balanceX = foundStructure.creditX + 100;
 
                     // DEFINE BOUNDARIES: Midpoints between header centers
-                    structure.boundaries = {
-                        debitLeft: (structure.debitX || 400) - 50, // Default left of debit
-                        debitCredit: (structure.debitX + structure.creditX) / 2,
-                        creditBalance: (structure.creditX + structure.balanceX) / 2
+                    foundStructure.boundaries = {
+                        debitLeft: (foundStructure.debitX || 400) - 50,
+                        debitCredit: (foundStructure.debitX + foundStructure.creditX) / 2,
+                        creditBalance: (foundStructure.creditX + foundStructure.balanceX) / 2
                     };
 
-                    console.log("[analyzeTableStructure] Final Bounded Structure:", structure);
-                    setTableStructure(structure);
+                    console.log("[analyzeTableStructure] ✓ Found structure (Strategy 1):", foundStructure);
+                    setTableStructure(foundStructure);
                     return;
                 }
             }
+
+            // STRATEGY 2: Look for numeric column patterns if headers aren't clearly labeled
+            // Find rows with numeric values that are likely table data rows
+            let numericRows = [];
+            for (const row of rows) {
+                const numericItems = row.filter(it => /^[0-9,.\-\s()₹]+$/.test(it.text.trim()) || it.text.trim() === '-');
+                if (numericItems.length >= 2) {
+                    numericRows.push({ row, numericItems });
+                }
+            }
+
+            // Requirement: At least 3 rows normally, but only 1 if it's the first page
+            const minRowsReq = page.pageIndex === 1 ? 1 : 3;
+
+            if (numericRows.length >= minRowsReq) {
+                // Filter rows: Ignore anything in the top 150 points (usually address section)
+                // BUT if it's Page 1 and we have very few rows, be more lenient
+                const yThreshold = page.pageIndex === 1 ? 750 : 620;
+                numericRows = numericRows.filter(({ row }) => row[0].y < yThreshold);
+                
+                if (numericRows.length >= (page.pageIndex === 1 ? 1 : 2)) {
+                    // Extract column positions from numeric rows
+                const xPositions = {};
+                numericRows.forEach(({ numericItems }) => {
+                    numericItems.forEach(item => {
+                        const x = Math.round(item.x);
+                        xPositions[x] = (xPositions[x] || 0) + 1;
+                    });
+                });
+
+                // Sort by frequency to find the most common column positions
+                const sortedCols = Object.entries(xPositions)
+                    .sort((a, b) => b[1] - a[1])
+                    .slice(0, 4)
+                    .map(([x]) => parseFloat(x));
+
+                // Filter: Table columns (Debit/Credit/Balance) MUST be on the right side (x > 350)
+                const rightCols = sortedCols.filter(x => x > 350).sort((a, b) => a - b);
+
+                if (rightCols.length >= 3) {
+                    foundStructure = {
+                        pageIndex: page.pageIndex,
+                        headerY: (rows[0]?.[0]?.y || 0) + 25, // Safer offset for multi-line headers
+                        debitX: rightCols[0],
+                        creditX: rightCols[1],
+                        balanceX: rightCols[2],
+                        boundaries: {
+                            debitLeft: rightCols[0] - 50,
+                            debitCredit: (rightCols[0] + rightCols[1]) / 2,
+                            creditBalance: (rightCols[1] + rightCols[2]) / 2
+                        }
+                    };
+                    console.log("[analyzeTableStructure] ✓ Found structure (Strategy 2 - numeric pattern):", foundStructure);
+                    setTableStructure(foundStructure);
+                    return;
+                }
+            }
+    }
+}
+
+        if (!foundStructure) {
+            console.warn("[analyzeTableStructure] ✗ NO TABLE STRUCTURE DETECTED");
+            console.warn("This PDF may not have a standard transaction table format.");
         }
     };
 
@@ -263,7 +335,16 @@ export function InPdfEditor(props) {
             setIsLoading(true);
             try {
                 setPagesData([]);
+                // Suppress non-critical PDF warnings
+                const pdfjsWorker = pdfjsLib.GlobalWorkerOptions.workerSrc;
+                
                 const loadingTask = pdfjsLib.getDocument(pwd ? { url: fileUrl, password: pwd } : fileUrl);
+                
+                // Don't fail on warnings - PDF might still be readable
+                loadingTask.onPassword = (updatePassword) => {
+                    if (pwd) updatePassword(pwd);
+                };
+                
                 const loadedPdf = await loadingTask.promise;
                 
                 if (pwd) pdfPasswordRef.current = pwd;
@@ -273,9 +354,10 @@ export function InPdfEditor(props) {
 
                 const allPagesData = [];
                 for (let i = 1; i <= loadedPdf.numPages; i++) {
-                    const page = await loadedPdf.getPage(i);
-                    const textContent = await page.getTextContent();
-                    const viewport = page.getViewport({ scale: 1 });
+                    try {
+                        const page = await loadedPdf.getPage(i);
+                        const textContent = await page.getTextContent({ normalizeWhitespace: true });
+                        const viewport = page.getViewport({ scale: 1 });
 
                     // Extract the actual text color from the page's operator list
                     let pageTextColor = null;
@@ -397,16 +479,37 @@ export function InPdfEditor(props) {
                         textColor: pageTextColor,
                         items: items.filter(item => item.text.trim().length > 0)
                     });
+                    } catch (pageErr) {
+                        console.warn(`[PDF] Error loading page ${i}:`, pageErr.message);
+                        // Continue with next page even if one fails
+                    }
                 }
                 setPagesData(allPagesData);
+                
+                // Log PDF diagnostic info
+                console.log(`[PDF Analysis] Total pages: ${allPagesData.length}`);
+                console.log(`[PDF Analysis] Total text items extracted: ${allPagesData.reduce((sum, p) => sum + p.items.length, 0)}`);
+                
                 analyzeTableStructure(allPagesData);
+                
+                // Clear any transform errors on successful load
+                setTransformError(null);
+                
+                // If table structure found, log success
+                if (tableStructure) {
+                    console.log(`✓ [PDF Analysis] Table structure detected successfully`);
+                } else {
+                    console.warn(`✗ [PDF Analysis] WARNING: Could not auto-detect table structure`);
+                    console.warn(`  This may be normal for non-standard PDFs`);
+                }
             } catch (error) {
                 if (error.name === 'PasswordException') {
                     const password = prompt('This PDF is password protected. Please enter the password:');
                     if (password) await loadPdf(password);
                 } else {
                     console.error("Error loading PDF:", error);
-                    alert("Failed to load PDF for editing.");
+                    setTransformError(`Failed to load PDF: ${error.message}`);
+                    alert(`Failed to load PDF for editing: ${error.message}`);
                 }
             } finally {
                 setIsLoading(false);
@@ -534,7 +637,7 @@ export function InPdfEditor(props) {
         if (!fileUrl) return;
         try {
             const fileName = fileUrl.split('/').pop() || 'statement.pdf';
-            const downloadUrl = `https://pdf-editor-2.onrender.com/api/statements/download-file?fileUrl=${encodeURIComponent(fileUrl)}`;
+            const downloadUrl = `http://localhost:5001/api/statements/download-file?fileUrl=${encodeURIComponent(fileUrl)}`;
             const response = await fetch(downloadUrl);
             if (!response.ok) throw new Error(`Server returned ${response.status}`);
             const blob = await response.blob();
@@ -591,13 +694,14 @@ export function InPdfEditor(props) {
         }
 
         try {
-            const response = await fetch('https://pdf-editor-2.onrender.com/api/statements/edit-direct', {
+            const response = await fetch('http://localhost:5001/api/statements/edit-direct', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     fileUrl,
                     changes,
-                    pageColors
+                    pageColors,
+                    password: pdfPasswordRef.current
                 })
             });
             const data = await response.json();
@@ -650,9 +754,18 @@ export function InPdfEditor(props) {
         setViewMode('pdf');
         try {
             if (!tableStructure) {
-                alert("Table structure not detected. Please ensure the PDF contains Debit/Credit/Balance headers.");
+                const userChoice = window.confirm(
+                    "⚠️ Table structure could not be auto-detected.\n\n" +
+                    "This PDF might have:\n" +
+                    "• Non-standard table layout\n" +
+                    "• Missing column headers (Date/Debit/Credit/Balance)\n" +
+                    "• Unusual formatting\n\n" +
+                    "Try uploading a different PDF with clear column headers.\n\n" +
+                    "Or continue anyway? (May result in incomplete transformation)"
+                );
                 setIsTransforming(false);
-                return;
+                if (!userChoice) return;
+                // If user chooses to continue, we'll attempt a best-effort approach
             }
 
             const changes = [];
@@ -701,18 +814,21 @@ export function InPdfEditor(props) {
             const txnRows = rows.filter(row => {
                 const firstItem = row[0];
                 if (!firstItem) return false;
-                const isAfterHeaderPage = firstItem.pageIdx > tableStructure.pageIndex;
-                const isOnHeaderPageBelowHeader = firstItem.pageIdx === tableStructure.pageIndex && firstItem.y < tableStructure.headerY - 10;
-                if (!isAfterHeaderPage && !isOnHeaderPageBelowHeader) return false;
+                
+                // VERTICAL GUARD: Skip very top of Page 1 (address/logo)
+                if (firstItem.pageIdx === 1 && firstItem.y > 780) return false;
 
                 const rowText = row.map(it => (it.text || '').toLowerCase()).join(' ');
+                // Skip summary/balance rows
                 if (rowText.includes('balance') && (rowText.includes('opening') || rowText.includes('closing'))) return false;
-                // Skip repeated table-header rows on subsequent pages
                 if (rowText.includes('transaction') && rowText.includes('debit') && rowText.includes('credit')) return false;
 
+                // Match Date Pattern
                 if (!txnDateRegex.test(rowText)) return false;
 
-                return row.some(it => Math.abs(it.x - tableStructure.balanceX) < 45);
+                // Must have at least one numeric item (Amount)
+                const numericCount = row.filter(it => /^[0-9,.\-₹]+$/.test(it.text.trim())).length;
+                return numericCount >= 1;
             });
 
             // 3. Pass: Map table data to these rows using VALUE-BASED MATCHING.
@@ -748,8 +864,9 @@ export function InPdfEditor(props) {
                 return -1;
             };
 
-            txnRows.forEach((row, idx) => {
-                // BOUNDED COLUMN ASSIGNMENT: Virtual "Walls" between columns
+            let globalRowIdx = 0;
+            txnRows.forEach((row) => {
+                // BOUNDED COLUMN ASSIGNMENT
                 const rowItems = row.filter(it => /^[0-9,.\-\s()₹]+$/.test(it.text.trim()) || it.text.trim() === '-');
                 const columnAssignments = { debit: null, credit: null, balance: null };
 
@@ -768,47 +885,52 @@ export function InPdfEditor(props) {
                     }
                 });
 
-                if (!columnAssignments.balance) return; // Skip rows with no balance item
+                if (!columnAssignments.balance) return; 
 
-                // Determine WHICH original transaction this PDF row belongs to
                 const origDebit   = cleanOrigNum(columnAssignments.debit?.originalText);
                 const origCredit  = cleanOrigNum(columnAssignments.credit?.originalText);
                 const origBalance = cleanOrigNum(columnAssignments.balance?.originalText);
 
                 const matchedIdx = findMatchingTxnIdx(origDebit, origCredit, origBalance);
-                const txn = matchedIdx >= 0 ? editedTxns[matchedIdx] : editedTxns[idx];
-                if (!txn) return;
-                if (matchedIdx >= 0) usedTxnIndices.add(matchedIdx);
+                
+                // Priority matching: 1. Value match, 2. Global sequence match
+                const txn = matchedIdx >= 0 ? editedTxns[matchedIdx] : editedTxns[globalRowIdx];
+                
+                if (txn) {
+                    if (matchedIdx >= 0) usedTxnIndices.add(matchedIdx);
+                    
+                    const fields = [
+                        { val: txn.debit, it: columnAssignments.debit },
+                        { val: txn.credit, it: columnAssignments.credit },
+                        { val: txn.balance, it: columnAssignments.balance },
+                    ];
 
-                const fields = [
-                    { val: txn.debit, it: columnAssignments.debit },
-                    { val: txn.credit, it: columnAssignments.credit },
-                    { val: txn.balance, it: columnAssignments.balance },
-                ];
+                    fields.forEach(({ val, it }) => {
+                        if (it) {
+                            const newVal = normalizeNum(val);
+                            if (newVal === 0 && (it.originalText === '-' || it.originalText.trim() === '')) return;
 
-                fields.forEach(({ val, it }) => {
-                    if (it) {
-                        const newVal = normalizeNum(val);
-                        // Dash safety - skip if newVal is 0 and it's already a dash/empty
-                        if (newVal === 0 && (it.originalText === '-' || it.originalText.trim() === '')) return;
-
-                        const formatted = formatLikeOriginal(newVal, it.originalText);
-                        if (it.originalText !== formatted) {
-                            changes.push({
-                                pageIndex: it.pageIdx,
-                                x: it.x,
-                                y: it.y,
-                                width: it.width,
-                                height: it.height,
-                                fontSize: it.fontSize,
-                                newText: formatted,
-                                isNumeric: true,
-                                isBold: false,
-                                isTableItem: true
-                            });
+                            const formatted = formatLikeOriginal(newVal, it.originalText);
+                            if (it.originalText !== formatted) {
+                                changes.push({
+                                    pageIndex: it.pageIdx,
+                                    x: it.x,
+                                    y: it.y,
+                                    width: it.width,
+                                    height: it.height,
+                                    fontSize: it.fontSize,
+                                    newText: formatted,
+                                    isNumeric: true,
+                                    isBold: false,
+                                    isTableItem: true,
+                                    hPadding: 0
+                                });
+                            }
                         }
-                    }
-                });
+                    });
+                }
+                
+                globalRowIdx++; // Increment global counter for EVERY transaction row found in PDF
             });
 
             // 3.5. Pass: Find and update the 'Total' row at the bottom of the table if it exists
@@ -995,24 +1117,84 @@ export function InPdfEditor(props) {
                 return;
             }
 
-            console.log(`[handleTransformWithPrecision] Submitting ${changes.length} changes to backend...`);
-            const response = await fetch('https://pdf-editor-2.onrender.com/api/statements/edit-direct', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ fileUrl, changes, password: pdfPasswordRef.current }),
+            // Collect per-page text colors for the backend
+            const pageColors = {};
+            pagesData.forEach(page => {
+                if (page.textColor) pageColors[page.pageIndex] = page.textColor;
             });
 
-            if (response.ok) {
-                const data = await response.json();
-                onUpdateFileUrl(data.fileUrl);
-                // The viewMode is already set to 'pdf' at the start
-            } else {
-                const err = await response.json();
-                alert(`Transformation failed: ${err.message || response.statusText}`);
-                setViewMode('table'); // Switch back on error so user can fix data
+            console.log(`[Transform] 📤 Submitting ${changes.length} changes to backend...`);
+            console.log(`[Transform] Current PDF: ${fileUrl}`);
+            
+            let transformResponse;
+            try {
+                const response = await fetch('http://localhost:5001/api/statements/edit-direct', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ fileUrl, changes, pageColors, password: pdfPasswordRef.current }),
+                });
+
+                if (!response.ok) {
+                    const err = await response.json();
+                    console.error(`[Transform] ❌ Server error: ${response.status}`, err);
+                    alert(`Transformation failed: ${err.message || response.statusText}`);
+                    setViewMode('table');
+                    return;
+                }
+
+                transformResponse = await response.json();
+                console.log(`[Transform] ✓ Backend response:`, transformResponse);
+            } catch (fetchErr) {
+                console.error(`[Transform] ❌ Network error:`, fetchErr);
+                alert(`Network error: ${fetchErr.message}`);
+                setViewMode('table');
+                return;
             }
+
+            if (!transformResponse.success) {
+                console.error(`[Transform] ❌ Transform failed:`, transformResponse.message);
+                alert(`Transformation failed: ${transformResponse.message}`);
+                setViewMode('table');
+                return;
+            }
+
+            const newFileUrl = transformResponse.fileUrl;
+            if (!newFileUrl) {
+                console.error(`[Transform] ❌ No file URL in response`);
+                alert('Transformation completed but file URL is missing');
+                setViewMode('table');
+                return;
+            }
+
+            console.log(`[Transform] 📥 New PDF URL: ${newFileUrl}`);
+            console.log(`[Transform] 📊 Stats:`, transformResponse.stats);
+
+            // Verify the file exists before updating state
+            try {
+                console.log(`[Transform] 🔍 Verifying file exists...`);
+                const headResponse = await fetch(newFileUrl, { method: 'HEAD' });
+                if (!headResponse.ok) {
+                    console.error(`[Transform] ⚠ File not accessible: ${headResponse.status}`);
+                } else {
+                    console.log(`[Transform] ✓ File verified (${headResponse.headers.get('content-length')} bytes)`);
+                }
+            } catch (headErr) {
+                console.warn(`[Transform] ⚠ Could not verify file:`, headErr.message);
+            }
+
+            // Update to new PDF
+            console.log(`[Transform] 🔄 Updating to new PDF...`);
+            onUpdateFileUrl(newFileUrl);
+
+            // Small delay to ensure previous renders are cancelled
+            setTimeout(() => {
+                console.log(`[Transform] 🔄 Triggering PDF reload...`);
+                setFileVersion(v => v + 1);
+            }, 100);
+
+            console.log(`[Transform] ✓ Transform flow complete!`);
         } catch (error) {
-            console.error('Transform error:', error);
+            console.error('[Transform] ❌ Unexpected error:', error);
             alert('An error occurred while transforming the PDF.');
         } finally {
             setIsTransforming(false);
@@ -1146,44 +1328,86 @@ export function InPdfEditor(props) {
 function PageItem({ pdf, pageData, scale, onTextChange, readOnly = false }) {
     const canvasRef = useRef(null);
     const [scaledViewport, setScaledViewport] = useState(null);
+    const renderTaskRef = useRef(null);
+    const isMountedRef = useRef(true);
 
     useEffect(() => {
-        let currentRenderTask = null;
+        isMountedRef.current = true;
+        return () => {
+            isMountedRef.current = false;
+        };
+    }, []);
+
+    useEffect(() => {
+        // Cancel previous render task before starting new one
+        if (renderTaskRef.current) {
+            try {
+                renderTaskRef.current.cancel();
+            } catch (e) {
+                // Ignore cancellation errors
+            }
+            renderTaskRef.current = null;
+        }
+
+        let isLatestRender = true;
 
         const renderPage = async () => {
-            if (!pdf || !canvasRef.current) return;
+            if (!pdf || !canvasRef.current || !isMountedRef.current || !isLatestRender) return;
 
             try {
                 const page = await pdf.getPage(pageData.pageIndex);
+                if (!isLatestRender || !isMountedRef.current) return;
+
                 const viewport = page.getViewport({ scale });
+                
+                if (!isMountedRef.current || !isLatestRender) return;
                 setScaledViewport(viewport);
 
                 const canvas = canvasRef.current;
-                const context = canvas.getContext('2d', { alpha: false });
+                if (!canvas || !isMountedRef.current || !isLatestRender) return;
 
+                const context = canvas.getContext('2d', { alpha: false });
                 canvas.height = viewport.height;
                 canvas.width = viewport.width;
 
-                currentRenderTask = page.render({
-                    canvasContext: context,
-                    viewport: viewport
-                });
+                // Clear canvas before rendering
+                context.clearRect(0, 0, canvas.width, canvas.height);
+                context.fillStyle = '#ffffff';
+                context.fillRect(0, 0, canvas.width, canvas.height);
 
-                await currentRenderTask.promise;
+                if (!isLatestRender || !isMountedRef.current) return;
+
+                try {
+                    renderTaskRef.current = page.render({
+                        canvasContext: context,
+                        viewport: viewport
+                    });
+
+                    await renderTaskRef.current.promise;
+                } finally {
+                    if (isLatestRender) {
+                        renderTaskRef.current = null;
+                    }
+                }
             } catch (error) {
-                if (error.name === 'RenderingCancelledException') {
-                    // Ignore cancellation errors as they are expected when zooming/scrolling
+                if (error.name === 'RenderingCancelledException' || !isLatestRender) {
                     return;
                 }
-                console.error("PDF Render Error:", error);
+                console.warn(`[PDF Render] Page ${pageData.pageIndex} warning:`, error.message);
             }
         };
 
         renderPage();
 
         return () => {
-            if (currentRenderTask) {
-                currentRenderTask.cancel();
+            isLatestRender = false;
+            if (renderTaskRef.current) {
+                try {
+                    renderTaskRef.current.cancel();
+                } catch (e) {
+                    // Ignore
+                }
+                renderTaskRef.current = null;
             }
         };
     }, [pdf, pageData.pageIndex, scale]);
@@ -1292,7 +1516,6 @@ function EditableText({ item, scale, viewport, onUpdate }) {
                 </div>
             )}
 
-            {/* Visual indicator for "Editable" */}
             <div className="absolute -top-5 left-0 opacity-0 group-hover:opacity-100 transition-opacity bg-blue-600 text-[9px] text-white px-1.5 py-0.5 rounded shadow-sm flex items-center gap-1 z-[110] pointer-events-none whitespace-nowrap">
                 <Search className="w-2.5 h-2.5" />
                 <span>Edit text</span>
@@ -1300,3 +1523,5 @@ function EditableText({ item, scale, viewport, onUpdate }) {
         </div>
     );
 }
+
+export default InPdfEditor;
